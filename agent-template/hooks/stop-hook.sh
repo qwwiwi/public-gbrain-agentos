@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# sdk-guard: skip when running as Agent SDK child to prevent recursion (issue #143)
+if [ "${CLAUDE_SDK_CHILD:-0}" = "1" ]; then
+    exit 0
+fi
+
 # Stop hook -- runs at the end of each Claude Code turn.
 # Appends a 200-char snippet to core/hot/recent.md, and a verbose JSON line to
 # logs/verbose-YYYY-MM-DD.jsonl for higher-fidelity replay.
@@ -26,6 +31,14 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [stop-hook] $1" >> "$HOOK_LOG"; }
 
 # Read stdin (may be empty if invoked manually)
 PAYLOAD=$(cat || true)
+
+# sdk-guard: skip when payload signals an Agent SDK child entrypoint
+if [ -n "$PAYLOAD" ]; then
+    if python3 -c "import json,sys; d=json.loads(sys.argv[1] or '{}'); sys.exit(0 if d.get('entrypoint')=='sdk-ts' else 1)" "$PAYLOAD" 2>/dev/null; then
+        log "sdk-guard: entrypoint=sdk-ts, skipping"
+        exit 0
+    fi
+fi
 
 if [ -z "$PAYLOAD" ]; then
     log "no stdin payload; nothing to record"

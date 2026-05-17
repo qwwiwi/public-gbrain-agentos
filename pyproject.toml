@@ -45,11 +45,16 @@ gbrain-recall-mcp = "services.recall_mcp.server:main"
 gbrain-swarm-mcp = "services.swarm_mcp.server:main"
 gbrain-swarm-worker = "services.swarm_mcp.worker:main"
 gbrain-ingest-worker = "services.ingest_worker.worker:main"
+gbrain-doctor = "scripts.gbrain_doctor:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["services*"]
-exclude = ["tests*", "migrations*", "scripts*"]
+# Include both `services*` (runtime) and `scripts*` (CLI entry points like
+# gbrain-doctor that pyproject.toml [project.scripts] references). M5:
+# without `scripts*` the gbrain-doctor entry point would fail to resolve
+# after `pip install .`.
+include = ["services*", "scripts*"]
+exclude = ["tests*", "migrations*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

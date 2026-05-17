@@ -1,7 +1,9 @@
 """MCP tools for memory-mcp write service (9 doc tools + 6 slot tools, gated by GBRAIN_TOOLS)."""
 import hashlib
+import json
 import logging
 import math
+import os
 import re
 import time
 from contextvars import ContextVar
@@ -15,8 +17,10 @@ from asyncpg import UniqueViolationError
 
 from services.shared.auth import AgentContext, authenticate, check_write_scope
 from services.shared.audit import log_audit
+from services.shared.config import _env_float_clamped
 from services.shared.tool_gating import should_register_tool
 
+from .jaccard import find_supersession_candidates, tokenize
 from .path_guard import validate_path
 
 logger = logging.getLogger(__name__)
@@ -190,6 +194,46 @@ def _scope_from_path(rel_path: str) -> str:
     return rel_path.split("/")[0]
 
 
+def _supersede_threshold_env(name: str, default: float) -> float:
+    """Read a Jaccard threshold from env with safe fallback.
+
+    Thin wrapper around :func:`services.shared.config._env_float_clamped`
+    that clamps into ``[0.0, 1.0]``. Emits a ``logger.warning`` when the
+    parsed raw value would have required clamping or fell back due to a
+    parse failure -- silent degradation was the H7 reviewer finding.
+
+    The auto-supersession path must never crash the write flow because of
+    an operator typo: missing/empty/invalid/NaN/inf all return ``default``,
+    and out-of-range values are clamped silently to operator view but
+    audibly to the logger.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a float; falling back to default %s",
+            name, raw, default,
+        )
+        return default
+    if math.isnan(parsed) or math.isinf(parsed):
+        logger.warning(
+            "%s=%r is NaN/inf; falling back to default %s",
+            name, raw, default,
+        )
+        return default
+    if parsed < 0.0 or parsed > 1.0:
+        clamped = _env_float_clamped(name, default, 0.0, 1.0)
+        logger.warning(
+            "%s=%r is outside [0.0, 1.0]; clamped to %s",
+            name, raw, clamped,
+        )
+        return clamped
+    return parsed
+
+
 async def _upsert_document(
     pool: asyncpg.Pool,
     rel_path: str,
@@ -356,7 +400,19 @@ def register_tools(
     ) -> str:
         """Create a decision note in 30-decisions/.
 
-        Immutable -- use supersede_decision for business-level changes.
+        Immutable by default -- use ``supersede_decision`` for business-level
+        chains. Jaccard auto-supersession runs before the insert: when the
+        new decision's token set overlaps an existing same-scope decision
+        with Jaccard >= ``GBRAIN_SUPERSEDE_AUTO`` (default 0.85), the old
+        decision's frontmatter is flipped to ``is_latest: false`` +
+        ``superseded_by: <new_path>`` inside a single transaction with the
+        new insert. When ``GBRAIN_SUPERSEDE_HINT`` (default 0.70) <=
+        Jaccard < auto threshold, the new doc is inserted unchanged and the
+        return value is a JSON string carrying ``suggested_supersedes``
+        for operator review.
+
+        Set ``GBRAIN_SUPERSEDE_AUTO=0`` to disable the auto branch entirely
+        (hints still surface in the 0.70-0.85 band).
         """
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
@@ -372,10 +428,328 @@ def register_tools(
         rel_path = f"{scope}/{_today_iso()}-{slug}.md"
         abs_path = validate_path(rel_path, vault_root)
 
+        # Read thresholds dynamically per-call so tests + operators can flip
+        # GBRAIN_SUPERSEDE_AUTO/HINT without restarting the service. Falls
+        # back to PLAN defaults when env is unset.
+        auto_threshold = _supersede_threshold_env("GBRAIN_SUPERSEDE_AUTO", 0.85)
+        hint_threshold = _supersede_threshold_env("GBRAIN_SUPERSEDE_HINT", 0.70)
+        if hint_threshold > auto_threshold and auto_threshold > 0:
+            # Misconfigured: degrade to hint-only mode to avoid surprise
+            # auto-mutations. Treat as auto disabled.
+            logger.warning(
+                "GBRAIN_SUPERSEDE_HINT (%s) > GBRAIN_SUPERSEDE_AUTO (%s); "
+                "degrading to hint-only mode (auto disabled)",
+                hint_threshold, auto_threshold,
+            )
+            auto_threshold = 0.0
+
+        new_tokens = tokenize(title + " " + body)
+
+        # Same-scope candidate fetch. Skip rows already superseded
+        # (is_latest=false) so chains are never re-mutated. Also exclude
+        # the path we're about to write -- C2: idempotent re-run with the
+        # same title+body must not match itself as an auto-supersession
+        # candidate (which would otherwise flip its own is_latest=false).
+        candidate_rows = await pool.fetch(
+            """
+            SELECT path, frontmatter, body
+            FROM documents
+            WHERE scope = $1
+              AND source_type = 'decision'
+              AND path != $2
+              AND (frontmatter->>'is_latest' IS NULL
+                   OR frontmatter->>'is_latest' != 'false')
+            """,
+            scope,
+            rel_path,
+        )
+
+        existing_rows: list[dict[str, Any]] = []
+        for row in candidate_rows:
+            fm_raw = row["frontmatter"]
+            if isinstance(fm_raw, str):
+                try:
+                    fm_parsed = json.loads(fm_raw)
+                except (ValueError, TypeError):
+                    fm_parsed = {}
+            elif isinstance(fm_raw, dict):
+                fm_parsed = fm_raw
+            else:
+                fm_parsed = {}
+            existing_rows.append(
+                {
+                    "path": row["path"],
+                    "frontmatter": fm_parsed,
+                    "body": row["body"] or "",
+                }
+            )
+
+        auto_candidates, hint_candidates = find_supersession_candidates(
+            new_tokens,
+            existing_rows,
+            auto_threshold=auto_threshold,
+            hint_threshold=hint_threshold,
+        )
+
+        # ------------------------------------------------------------------
+        # Branch 1: auto-supersession
+        # ------------------------------------------------------------------
+        if auto_candidates:
+            inherited: list[str] = []
+            superseded_paths: list[str] = []
+            for cand in auto_candidates:
+                superseded_paths.append(cand.path)
+                prior = cand.frontmatter.get("supersedes") if cand.frontmatter else None
+                if isinstance(prior, list):
+                    inherited.extend(str(p) for p in prior)
+
+            supersedes_chain: list[str] = []
+            seen: set[str] = set()
+            for p in superseded_paths + inherited:
+                if p not in seen:
+                    seen.add(p)
+                    supersedes_chain.append(p)
+
+            # Cache timestamps once so created/updated never skew by microseconds
+            # (M9). Single _now_iso() call per branch.
+            now_ts = _now_iso()
+            fm: dict[str, Any] = {
+                "type": "decision",
+                "created": now_ts,
+                "updated": now_ts,
+                "agent": resolved_agent,
+                "tags": tags,
+                "related": related or [],
+                "priority": "P2",
+                "is_latest": True,
+                "supersedes": supersedes_chain,
+            }
+            content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
+            content_hash = _sha256(content)
+
+            # ----------------------------------------------------------
+            # C5 idempotency: if a row already exists at rel_path with
+            # the exact same sha256, short-circuit. We still need to
+            # verify auto candidates would actually require a flip --
+            # candidates were already filtered by SQL `is_latest != false`
+            # AND the new path is excluded (C2), so any non-empty
+            # auto_candidates list means real work would happen if we
+            # proceeded. The short-circuit only triggers when the row is
+            # byte-identical AND no candidates are present, which is the
+            # genuine "nothing to do" case.
+            # ----------------------------------------------------------
+            existing_self = await pool.fetchrow(
+                "SELECT id, sha256 FROM documents WHERE path = $1",
+                rel_path,
+            )
+            if (
+                existing_self is not None
+                and existing_self["sha256"] == content_hash
+                and not auto_candidates  # impossible here (we're in this branch
+                                          # because auto_candidates is truthy);
+                                          # kept for symmetry with branch 2/3.
+            ):
+                await log_audit(
+                    pool, resolved_agent, "create_decision_note",
+                    {"title": title, "path": rel_path}, "unchanged",
+                    int((time.monotonic() - t0) * 1000),
+                )
+                return f"unchanged: {rel_path}"
+
+            # Pre-fetch each candidate's *current* markdown so we can
+            # rewrite the on-disk frontmatter (C4) atomically with the DB
+            # mutation. Reading happens outside the transaction; writes
+            # happen after the DB commit succeeds. Vault is canonical:
+            # both DB row and file must reflect is_latest=false +
+            # superseded_by=<new_path>.
+            cand_files: list[tuple[str, Path, str | None]] = []
+            for cand in auto_candidates:
+                try:
+                    cand_abs = validate_path(cand.path, vault_root)
+                except ValueError:
+                    cand_abs = None
+                existing_md: str | None = None
+                if cand_abs is not None and cand_abs.exists():
+                    try:
+                        existing_md = cand_abs.read_text(encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not read superseded vault file %s: %s",
+                            cand.path, exc,
+                        )
+                cand_files.append((cand.path, cand_abs, existing_md))
+
+            try:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            """
+                            INSERT INTO documents
+                                (path, frontmatter, body, sha256, source_type,
+                                 agent, scope)
+                            VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7)
+                            ON CONFLICT (path) DO UPDATE SET
+                                frontmatter = EXCLUDED.frontmatter,
+                                body = EXCLUDED.body,
+                                sha256 = EXCLUDED.sha256,
+                                source_type = EXCLUDED.source_type,
+                                agent = EXCLUDED.agent,
+                                scope = EXCLUDED.scope,
+                                updated_at = now()
+                            """,
+                            rel_path,
+                            _json_dumps(fm),
+                            body,
+                            content_hash,
+                            "decision",
+                            resolved_agent,
+                            scope,
+                        )
+                        for cand in auto_candidates:
+                            await conn.execute(
+                                """
+                                UPDATE documents
+                                SET frontmatter = jsonb_set(
+                                        jsonb_set(
+                                            frontmatter,
+                                            '{is_latest}',
+                                            'false'::jsonb
+                                        ),
+                                        '{superseded_by}',
+                                        to_jsonb($2::text)
+                                    ),
+                                    updated_at = now()
+                                WHERE path = $1
+                                """,
+                                cand.path,
+                                rel_path,
+                            )
+                        # H4: audit rows go inside the transaction so a
+                        # failure observably rolls them back instead of
+                        # being silently swallowed by log_audit's
+                        # try/except. We INSERT directly via conn.execute
+                        # rather than going through log_audit (which uses
+                        # a separate pool connection and swallows errors
+                        # to protect the main write flow).
+                        for cand in auto_candidates:
+                            await conn.execute(
+                                """
+                                INSERT INTO audit_log
+                                    (agent, tool, args_summary, result_status,
+                                     latency_ms, error)
+                                VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+                                """,
+                                resolved_agent,
+                                "decision_auto_supersede",
+                                json.dumps(
+                                    {
+                                        "old_path": cand.path,
+                                        "new_path": rel_path,
+                                        "jaccard": round(cand.jaccard, 3),
+                                        "scope": scope,
+                                    },
+                                    ensure_ascii=False,
+                                    default=str,
+                                ),
+                                "ok",
+                                int((time.monotonic() - t0) * 1000),
+                                None,
+                            )
+
+                # ----------------------------------------------------------
+                # Vault file writes happen after DB commits successfully.
+                # C3 trade-off: DB is the strict canonical write boundary
+                # because we must keep the multi-row mutation atomic.
+                # Vault filesystem is rebuilt-from-DB on doctor `--fix`;
+                # see DEVIATIONS for the rationale.
+                # ----------------------------------------------------------
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_path.write_text(content, encoding="utf-8")
+
+                # C4: rewrite frontmatter of each superseded vault file so
+                # the filesystem reflects is_latest=false + superseded_by.
+                for cand_path, cand_abs, existing_md in cand_files:
+                    if cand_abs is None or existing_md is None:
+                        # Candidate file missing on disk or path-guard
+                        # rejected it: DB row is already flipped, log and
+                        # continue so the rest of the update still lands.
+                        logger.warning(
+                            "Skipping vault rewrite for %s (file missing or path-guard failed)",
+                            cand_path,
+                        )
+                        continue
+                    parsed_fm = _parse_frontmatter(existing_md) or {}
+                    parsed_fm["is_latest"] = False
+                    parsed_fm["superseded_by"] = rel_path
+                    parsed_fm["updated"] = now_ts
+                    # Recover body after the original frontmatter block.
+                    body_part = existing_md
+                    if existing_md.startswith("---"):
+                        end_idx = existing_md.find("---", 3)
+                        if end_idx != -1:
+                            body_part = existing_md[end_idx + 3 :]
+                            # Drop leading newline left by frontmatter end.
+                            if body_part.startswith("\n"):
+                                body_part = body_part[1:]
+                    new_md = _build_frontmatter(parsed_fm) + body_part
+                    try:
+                        cand_abs.write_text(new_md, encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not rewrite superseded vault file %s: %s",
+                            cand_path, exc,
+                        )
+
+                # Best-effort: fetch new doc_id for embedding queue. Skip
+                # silently if not found (test fakes might not return it).
+                new_doc_id = await pool.fetchval(
+                    "SELECT id FROM documents WHERE path = $1", rel_path
+                )
+                if isinstance(new_doc_id, int):
+                    await _queue_embedding(pool, new_doc_id)
+            except Exception as exc:
+                await log_audit(
+                    pool,
+                    resolved_agent,
+                    "create_decision_note",
+                    {
+                        "title": title,
+                        "path": rel_path,
+                        "auto_supersede_attempted": True,
+                    },
+                    "error",
+                    int((time.monotonic() - t0) * 1000),
+                    error=str(exc),
+                )
+                raise
+
+            await log_audit(
+                pool,
+                resolved_agent,
+                "create_decision_note",
+                {
+                    "title": title,
+                    "path": rel_path,
+                    "superseded": [c.path for c in auto_candidates],
+                },
+                "ok",
+                int((time.monotonic() - t0) * 1000),
+            )
+            # H5: historical success return shape is `created: <path>` --
+            # keep it for the auto branch so clients that grep for the
+            # prefix continue to work. JSON shape with _auto_superseded is
+            # NOT a public contract for the success case.
+            return f"created: {rel_path}"
+
+        # ------------------------------------------------------------------
+        # Branch 2: hint band (insert normally + return hint payload)
+        # ------------------------------------------------------------------
+        # Cache the timestamp once (M9) so created/updated never skew.
+        now_ts = _now_iso()
         fm = {
             "type": "decision",
-            "created": _now_iso(),
-            "updated": _now_iso(),
+            "created": now_ts,
+            "updated": now_ts,
             "agent": resolved_agent,
             "tags": tags,
             "related": related or [],
@@ -384,7 +758,6 @@ def register_tools(
         content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
         content_hash = _sha256(content)
 
-        # Idempotency check
         doc_id, changed = await _upsert_document(
             pool, rel_path, fm, body, content_hash, "decision", resolved_agent,
         )
@@ -394,13 +767,54 @@ def register_tools(
                 {"title": title, "path": rel_path}, "unchanged",
                 int((time.monotonic() - t0) * 1000),
             )
+            # M10: when content is unchanged but there are hint candidates
+            # to surface, return JSON with `unchanged: true` so the caller
+            # still sees the suggestion. Without candidates keep the plain
+            # `unchanged: <path>` string for backward-compat.
+            if hint_candidates:
+                return json.dumps(
+                    {
+                        "path": rel_path,
+                        "unchanged": True,
+                        "suggested_supersedes": [
+                            {"path": c.path, "jaccard": round(c.jaccard, 3)}
+                            for c in hint_candidates
+                        ],
+                    }
+                )
             return f"unchanged: {rel_path}"
 
-        # Write file
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(content, encoding="utf-8")
 
         await _queue_embedding(pool, doc_id)
+
+        if hint_candidates:
+            await log_audit(
+                pool,
+                resolved_agent,
+                "create_decision_note",
+                {
+                    "title": title,
+                    "path": rel_path,
+                    "hint_candidates": [c.path for c in hint_candidates],
+                },
+                "ok",
+                int((time.monotonic() - t0) * 1000),
+            )
+            return json.dumps(
+                {
+                    "path": rel_path,
+                    "suggested_supersedes": [
+                        {"path": c.path, "jaccard": round(c.jaccard, 3)}
+                        for c in hint_candidates
+                    ],
+                }
+            )
+
+        # ------------------------------------------------------------------
+        # Branch 3: below hint -- existing behavior unchanged
+        # ------------------------------------------------------------------
         await log_audit(
             pool, resolved_agent, "create_decision_note",
             {"title": title, "path": rel_path}, "ok",

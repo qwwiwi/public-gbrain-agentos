@@ -2,6 +2,11 @@
 # shellcheck disable=SC2012
 set -euo pipefail
 
+# sdk-guard: skip when running as Agent SDK child to prevent recursion (issue #143)
+if [ "${CLAUDE_SDK_CHILD:-0}" = "1" ]; then
+    exit 0
+fi
+
 # PreCompact hook -- snapshot recent.md before Claude Code auto-compacts context.
 # Keeps the last N pre-compact snapshots so you can recover state if compaction
 # loses information you cared about.

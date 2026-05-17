@@ -57,6 +57,44 @@ def _env_float(name: str, default: str, min_value: float = 0.0) -> float:
     return value
 
 
+def _env_float_clamped(
+    name: str,
+    default: float,
+    lo: float,
+    hi: float,
+) -> float:
+    """Parse a float env var, clamp to ``[lo, hi]``, fall back on bad input.
+
+    Designed for hot-path callers where startup must never fail because of an
+    operator typo: missing/empty/invalid/NaN/inf all return ``default``, and
+    out-of-range values are clamped silently (callers may emit a logger
+    warning themselves).
+
+    Args:
+        name: Environment variable name.
+        default: Fallback value used when the env var is unset / invalid.
+        lo: Inclusive lower bound. Values below are clamped up to ``lo``.
+        hi: Inclusive upper bound. Values above are clamped down to ``hi``.
+
+    Returns:
+        Clamped float in ``[lo, hi]``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(value) or math.isinf(value):
+        return default
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
 def _env_int(
     name: str,
     default: str,
@@ -144,6 +182,51 @@ class Config:
             "GBRAIN_DIVERSIFY_MAX", "0", min_value=0, max_value=100
         )
     )
+    supersede_auto_threshold: float = field(
+        default_factory=lambda: _env_float(
+            "GBRAIN_SUPERSEDE_AUTO", "0.85", min_value=0.0
+        )
+    )
+    supersede_hint_threshold: float = field(
+        default_factory=lambda: _env_float(
+            "GBRAIN_SUPERSEDE_HINT", "0.70", min_value=0.0
+        )
+    )
+
+    def __post_init__(self) -> None:
+        """Cross-field validation.
+
+        Enforces ``supersede_hint_threshold <= supersede_auto_threshold`` so
+        the hint band ``[hint, auto)`` is non-empty and the auto band
+        ``[auto, 1.0]`` does not overlap into hint territory.
+
+        ``GBRAIN_SUPERSEDE_AUTO=0.0`` is the documented disable sentinel
+        (.env.example: "Set to 0 to disable auto-supersession entirely").
+        In that mode the hint > auto cross-validation is intentionally
+        skipped because there is no auto band to overlap into -- the hint
+        band runs from ``hint_threshold`` to 1.0 and the auto branch is
+        permanently disabled inside ``tools.py`` (see line 419 area). The
+        upper-bound check on hint still applies so misconfigurations like
+        ``HINT=1.5`` continue to fail loudly.
+        """
+        # Skip cross-field validation when auto is disabled via the sentinel.
+        if self.supersede_auto_threshold != 0.0:
+            if self.supersede_hint_threshold > self.supersede_auto_threshold:
+                raise RuntimeError(
+                    "GBRAIN_SUPERSEDE_HINT "
+                    f"({self.supersede_hint_threshold}) must be <= "
+                    f"GBRAIN_SUPERSEDE_AUTO ({self.supersede_auto_threshold})"
+                )
+            if self.supersede_auto_threshold > 1.0:
+                raise RuntimeError(
+                    f"GBRAIN_SUPERSEDE_AUTO ({self.supersede_auto_threshold}) "
+                    "must be <= 1.0 (Jaccard cannot exceed 1.0)"
+                )
+        if self.supersede_hint_threshold > 1.0:
+            raise RuntimeError(
+                f"GBRAIN_SUPERSEDE_HINT ({self.supersede_hint_threshold}) "
+                "must be <= 1.0 (Jaccard cannot exceed 1.0)"
+            )
 
     def get_pg_dsn(self) -> dict[str, str | int]:
         """Return asyncpg connection kwargs.

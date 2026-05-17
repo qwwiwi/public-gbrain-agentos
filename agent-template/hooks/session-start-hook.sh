@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# sdk-guard: skip when running as Agent SDK child to prevent recursion (issue #143)
+if [ "${CLAUDE_SDK_CHILD:-0}" = "1" ]; then
+    exit 0
+fi
+
 # SessionStart hook -- runs once at the start of a Claude Code session.
 # 1) Logs that a session started.
 # 2) If gbrain MCP credentials are present, calls gbrain-recall-on-start.sh to
