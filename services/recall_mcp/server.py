@@ -1,10 +1,13 @@
 """FastMCP server for recall-mcp (read-side hybrid search), default port 8768.
 
 Adopts the AuthCaptureMiddleware pattern from swarm-mcp and memory-mcp so all
-three services have consistent identity surfacing. The recall tools are
-read-only and currently do not require token validation, but the middleware
-publishes Authorization into a ContextVar (services.recall_mcp.search._REQUEST_AUTH)
-for future per-token scoping without re-wiring the server.
+three services have consistent identity surfacing. The recall tools require
+token validation (Bearer or HMAC) and enforce ``agent_tokens.can_read_scopes``
+per-call via :func:`services.recall_mcp.search._resolve_reader` and
+``restrict_read_scopes`` / ``check_read_scope`` from :mod:`services.shared.auth`.
+The middleware publishes the captured auth into a ContextVar
+(``services.recall_mcp.search._REQUEST_AUTH``) which every tool body
+consults.
 """
 import logging
 import os
@@ -20,6 +23,7 @@ from fastmcp import FastMCP
 # Ensure parent package is importable when running as module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from services.shared.asgi_auth import HermesAwareAuthMiddleware
 from services.shared.config import Config
 from services.shared.db import close_pool, get_pool
 
@@ -118,30 +122,17 @@ register_tools(
 )
 
 
-class AuthCaptureMiddleware:
-    """ASGI middleware: capture Authorization header per-request into ContextVar.
+class AuthCaptureMiddleware(HermesAwareAuthMiddleware):
+    """ASGI middleware: capture Bearer or Hermes HMAC auth into ContextVar.
 
-    Mirrors swarm-mcp and memory-mcp pattern for consistent identity surfacing
-    across all three MCP services.
+    Thin compatibility subclass over :class:`HermesAwareAuthMiddleware`
+    that binds the recall-mcp ContextVar. Mirrors swarm-mcp and
+    memory-mcp pattern for consistent identity surfacing across all
+    three MCP services.
     """
 
     def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        auth = None
-        for k, v in scope.get("headers", []):
-            if k.lower() == b"authorization":
-                auth = v.decode("latin-1")
-                break
-        token = _REQUEST_AUTH.set(auth)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            _REQUEST_AUTH.reset(token)
+        super().__init__(app, _REQUEST_AUTH)
 
 
 def main() -> None:

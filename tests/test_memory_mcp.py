@@ -16,7 +16,6 @@ from services.memory_mcp.tools import (
     _assert_slot_size,
     _build_frontmatter,
     _extract_frontmatter_block,
-    _extract_token,
     _parse_frontmatter,
     _sha256,
     _slot_payload,
@@ -196,48 +195,7 @@ class TestExtractFrontmatterBlock:
 
 
 # -----------------------------------------------------------------------
-# ExtractToken
-# -----------------------------------------------------------------------
-class TestExtractToken:
-    """Tests for _extract_token (ContextVar primary, ctx fallback, no env)."""
-
-    @pytest.mark.asyncio
-    async def test_valid_token(self) -> None:
-        ctx = {"headers": {"authorization": "Bearer my-secret-token"}}
-        token = await _extract_token(ctx)
-        assert token == "my-secret-token"
-
-    @pytest.mark.asyncio
-    async def test_capitalized_header(self) -> None:
-        ctx = {"headers": {"Authorization": "Bearer capitalized-token"}}
-        token = await _extract_token(ctx)
-        assert token == "capitalized-token"
-
-    @pytest.mark.asyncio
-    async def test_missing_header_raises(self) -> None:
-        with pytest.raises(PermissionError, match="Missing or malformed"):
-            await _extract_token({"headers": {}})
-
-    @pytest.mark.asyncio
-    async def test_no_headers_key_raises(self) -> None:
-        with pytest.raises(PermissionError, match="Missing or malformed"):
-            await _extract_token({})
-
-    @pytest.mark.asyncio
-    async def test_basic_auth_rejected(self) -> None:
-        ctx = {"headers": {"authorization": "Basic dXNlcjpwYXNz"}}
-        with pytest.raises(PermissionError, match="Missing or malformed"):
-            await _extract_token(ctx)
-
-    @pytest.mark.asyncio
-    async def test_empty_bearer_rejected(self) -> None:
-        ctx = {"headers": {"authorization": "Token abc"}}
-        with pytest.raises(PermissionError, match="Missing or malformed"):
-            await _extract_token(ctx)
-
-
-# -----------------------------------------------------------------------
-# Auth
+# Auth (H8: _extract_token helper deleted — Bearer-only legacy)
 # -----------------------------------------------------------------------
 class TestAuth:
     """Tests for authenticate and check_write_scope."""
@@ -1174,7 +1132,7 @@ class TestSlotTools:
     async def test_slot_reads_require_valid_auth(self) -> None:
         pool = FakePool()
         recorder, _ = _register_slot_tools(pool)
-        # No Authorization header anywhere -> _extract_token raises
+        # No Authorization header anywhere -> _authenticate_request raises
         token = _REQUEST_AUTH.set(None)
         try:
             with pytest.raises(PermissionError, match="Missing or malformed"):
@@ -1183,18 +1141,6 @@ class TestSlotTools:
                 await recorder.tools["slot_get"](
                     label="x", ctx={"headers": {}}
                 )
-        finally:
-            _REQUEST_AUTH.reset(token)
-
-    @pytest.mark.asyncio
-    async def test_existing_extract_token_contextvar_still_primary(self) -> None:
-        # ContextVar wins over ctx fallback
-        token = _REQUEST_AUTH.set("Bearer ctxvar-token")
-        try:
-            out = await _extract_token(
-                {"headers": {"authorization": "Bearer fallback-token"}}
-            )
-            assert out == "ctxvar-token"
         finally:
             _REQUEST_AUTH.reset(token)
 
@@ -1390,3 +1336,42 @@ class TestSlotTools:
                 _REQUEST_AUTH.reset(t)
         # No UPDATE should have been issued
         assert not [c for c in pool.fetchrow_calls if "UPDATE slots" in c[0]]
+
+
+# -----------------------------------------------------------------------
+# Hermes HMAC dual-auth: ContextVar may now hold AuthValue (str|HmacAuthValue|None)
+# H8: _extract_token helper deleted — legacy Bearer-only path is gone.
+# -----------------------------------------------------------------------
+
+
+class TestAuthenticateRequestDispatch:
+    """``_authenticate_request`` dispatches between Bearer and HMAC paths."""
+
+    @pytest.mark.asyncio
+    async def test_bearer_path_calls_local_authenticate(self) -> None:
+        from services.memory_mcp.tools import _authenticate_request
+
+        pool = MagicMock()
+        ctx_fake = AgentContext(agent="claude", write_scopes=["*"], read_scopes=["*"])
+        with patch(
+            "services.memory_mcp.tools.authenticate",
+            new=AsyncMock(return_value=ctx_fake),
+        ):
+            t = _REQUEST_AUTH.set("Bearer abc")
+            try:
+                ctx = await _authenticate_request({}, pool)
+            finally:
+                _REQUEST_AUTH.reset(t)
+        assert ctx.agent == "claude"
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_rejected(self) -> None:
+        from services.memory_mcp.tools import _authenticate_request
+
+        pool = MagicMock()
+        t = _REQUEST_AUTH.set(None)
+        try:
+            with pytest.raises(PermissionError):
+                await _authenticate_request({}, pool)
+        finally:
+            _REQUEST_AUTH.reset(t)

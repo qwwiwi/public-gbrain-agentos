@@ -15,9 +15,17 @@ import asyncpg
 import yaml
 from asyncpg import UniqueViolationError
 
-from services.shared.auth import AgentContext, authenticate, check_write_scope
+from services.shared.auth import (
+    AgentContext,
+    AuthValue,
+    HmacAuthValue,
+    authenticate,
+    authenticate_captured,
+    check_write_scope,
+    resolve_request_identity,
+)
 from services.shared.audit import log_audit
-from services.shared.config import _env_float_clamped
+from services.shared.config import Config, _env_float_clamped
 from services.shared.tool_gating import should_register_tool
 
 from .jaccard import find_supersession_candidates, tokenize
@@ -25,9 +33,11 @@ from .path_guard import validate_path
 
 logger = logging.getLogger(__name__)
 
-# Per-request Authorization header captured by ASGI middleware in server.py.
-# Workaround for FastMCP stateless HTTP not surfacing request headers via ctx.
-_REQUEST_AUTH: ContextVar[str | None] = ContextVar("memory_request_auth", default=None)
+# Per-request auth captured by ASGI middleware in server.py. Holds a
+# Bearer string (existing behavior), a HmacAuthValue (Hermes HMAC), or
+# None. Workaround for FastMCP stateless HTTP not surfacing request
+# headers via ctx.
+_REQUEST_AUTH: ContextVar[AuthValue] = ContextVar("memory_request_auth", default=None)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,9 +156,14 @@ async def _authenticate_for_slots(
     ctx: dict[str, object] | None,
     pool: asyncpg.Pool,
 ) -> AgentContext:
-    """Extract bearer token and authenticate. No silent fallback."""
-    token = await _extract_token(ctx or {})
-    return await authenticate(token, pool)
+    """Authenticate the slot tool caller (Bearer or Hermes HMAC).
+
+    Routes through :func:`_authenticate_request` so HMAC-authenticated
+    agents (e.g. Tyrande) reach slot tools end-to-end, not only the
+    middleware. No silent fallback — missing/invalid auth raises
+    ``PermissionError``.
+    """
+    return await _authenticate_request(ctx, pool)
 
 
 def _require_slots_write(agent_ctx: AgentContext) -> None:
@@ -312,41 +327,85 @@ async def _queue_embedding(pool: asyncpg.Pool, doc_id: int) -> None:
     )
 
 
-async def _extract_token(ctx) -> str:
-    """Extract bearer token. Reads ContextVar set by AuthCaptureMiddleware first,
-    falls back to ctx.request_context for non-HTTP transports.
+def _load_runtime_config() -> Config:
+    """Build a lightweight Config snapshot for per-request auth.
 
-    No silent env fallback -- mis-attribution caused identity bug 2026-05-09/16.
+    Reads ``HMAC_TIMESTAMP_TOLERANCE_SECONDS`` and ``GBRAIN_HMAC_AUTH_ENABLED``
+    from env. Other Config fields require PG_PASSWORD/MCP_PORT at the
+    process level and are irrelevant to per-request auth, so we
+    constructor-set them with safe placeholders to avoid spurious
+    startup-style failures when this is called inside a unit test that
+    does not set PG_PASSWORD.
 
-    Args:
-        ctx: MCP context (dict OR Context object OR None).
-
-    Returns:
-        Raw token string.
-
-    Raises:
-        PermissionError: If Authorization header is missing or malformed.
+    Production process startup builds the full Config; this helper is
+    only for the auth tolerance + kill-switch knobs.
     """
-    # Path 1: ContextVar (primary, set by ASGI middleware in server.py)
-    auth = _REQUEST_AUTH.get() or ""
+    # Read the two knobs directly so we do not depend on a fully-built
+    # Config (which would require PG_PASSWORD + MCP_PORT in env).
+    raw_tol = os.environ.get("HMAC_TIMESTAMP_TOLERANCE_SECONDS", "300")
+    try:
+        tol = int(raw_tol)
+    except (TypeError, ValueError):
+        tol = 300
+    if tol < 1:
+        tol = 300
+    elif tol > 86400:
+        tol = 86400
 
-    # Path 2: legacy ctx.request_context (kept for compatibility / non-HTTP)
-    if not auth:
-        headers = {}
-        try:
-            if hasattr(ctx, "request_context") and ctx.request_context:
-                req = getattr(ctx.request_context, "request", None)
-                if req and hasattr(req, "headers"):
-                    headers = dict(req.headers)
-            elif isinstance(ctx, dict):
-                headers = ctx.get("headers", {})
-        except Exception:
-            pass
-        auth = headers.get("authorization", headers.get("Authorization", "")) if headers else ""
+    raw_kill = os.environ.get("GBRAIN_HMAC_AUTH_ENABLED", "1").strip().lower()
+    if raw_kill in {"0", "false", "no", "off"}:
+        hmac_enabled = False
+    else:
+        hmac_enabled = True
 
-    if auth.startswith("Bearer "):
-        return auth[7:]
-    raise PermissionError("Missing or malformed Authorization header")
+    # Stash on a tiny shim so callers can access ``.hmac_timestamp_tolerance_seconds``
+    # and ``.hmac_auth_enabled`` identically to a full Config.
+    class _RuntimeAuthConfig:
+        hmac_timestamp_tolerance_seconds = tol
+        hmac_auth_enabled = hmac_enabled
+
+    return _RuntimeAuthConfig()  # type: ignore[return-value]
+
+
+async def _authenticate_request(ctx, pool: asyncpg.Pool) -> AgentContext:
+    """Authenticate the current request via the shared resolver.
+
+    Thin wrapper around :func:`services.shared.auth.resolve_request_identity`
+    that:
+
+    * Reads the memory-mcp ContextVar populated by the ASGI middleware.
+    * Applies the operator HMAC kill-switch
+      (``GBRAIN_HMAC_AUTH_ENABLED=0`` → HMAC rejected, Bearer keeps
+      working).
+    * Bridges existing tests that monkeypatch
+      ``services.memory_mcp.tools.authenticate`` (Bearer path) so the
+      legacy double-import-monkeypatch pattern still functions.
+
+    ``ctx`` is accepted for backward-compat with tool signatures but
+    no longer consulted — the ContextVar is the only source of truth
+    once the ASGI middleware has captured the request.
+    """
+    cfg = _load_runtime_config()
+
+    # Honor monkeypatches on ``services.memory_mcp.tools.authenticate``
+    # (used by ~30 existing tests). When the captured auth is a Bearer
+    # string, route through the module-level ``authenticate`` so any
+    # patch takes effect.
+    auth_value: AuthValue = _REQUEST_AUTH.get()
+    if isinstance(auth_value, str):
+        if not auth_value.startswith("Bearer "):
+            raise PermissionError("Missing or malformed Authorization header")
+        token = auth_value[7:]
+        if not token:
+            raise PermissionError("Missing or malformed Authorization header")
+        return await authenticate(token, pool)
+
+    return await resolve_request_identity(
+        _REQUEST_AUTH,
+        pool,
+        hmac_auth_enabled=cfg.hmac_auth_enabled,
+        tolerance_seconds=cfg.hmac_timestamp_tolerance_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -416,14 +475,18 @@ def register_tools(
         """
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "30-decisions"
 
         if not check_write_scope(agent_ctx, scope):
             raise PermissionError(f"Agent '{agent_ctx.agent}' cannot write to {scope}")
 
-        resolved_agent = agent or agent_ctx.agent
+        # C1 fix (security): identity used for audit_log + documents.agent
+        # MUST be the authenticated caller, never the tool parameter. The
+        # optional ``agent`` parameter is preserved for human-readable
+        # frontmatter attribution only.
+        resolved_agent = agent_ctx.agent
+        declared_author = agent if (agent and agent != agent_ctx.agent) else None
         slug = _slugify(title)
         rel_path = f"{scope}/{_today_iso()}-{slug}.md"
         abs_path = validate_path(rel_path, vault_root)
@@ -524,6 +587,8 @@ def register_tools(
                 "is_latest": True,
                 "supersedes": supersedes_chain,
             }
+            if declared_author is not None:
+                fm["declared_author"] = declared_author
             content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
             content_hash = _sha256(content)
 
@@ -755,6 +820,8 @@ def register_tools(
             "related": related or [],
             "priority": "P2",
         }
+        if declared_author is not None:
+            fm["declared_author"] = declared_author
         content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
         content_hash = _sha256(content)
 
@@ -836,19 +903,21 @@ def register_tools(
         """Create a runbook note in 70-runbooks/."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "70-runbooks"
 
         if not check_write_scope(agent_ctx, scope):
             raise PermissionError(f"Agent '{agent_ctx.agent}' cannot write to {scope}")
 
-        resolved_agent = agent or agent_ctx.agent
+        # C1 fix (security): identity stays authenticated. Tool ``agent``
+        # parameter is human-attribution only — never the audit identity.
+        resolved_agent = agent_ctx.agent
+        declared_author = agent if (agent and agent != agent_ctx.agent) else None
         slug = _slugify(title)
         rel_path = f"{scope}/{slug}.md"
         abs_path = validate_path(rel_path, vault_root)
 
-        fm = {
+        fm: dict[str, Any] = {
             "type": "runbook",
             "created": _now_iso(),
             "updated": _now_iso(),
@@ -856,6 +925,8 @@ def register_tools(
             "tags": tags,
             "related": [],
         }
+        if declared_author is not None:
+            fm["declared_author"] = declared_author
         content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
         content_hash = _sha256(content)
 
@@ -899,19 +970,21 @@ def register_tools(
         """Create an error pattern note in 80-error-patterns/."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "80-error-patterns"
 
         if not check_write_scope(agent_ctx, scope):
             raise PermissionError(f"Agent '{agent_ctx.agent}' cannot write to {scope}")
 
-        resolved_agent = agent or agent_ctx.agent
+        # C1 fix (security): identity stays authenticated. Tool ``agent``
+        # parameter is human-attribution only — never the audit identity.
+        resolved_agent = agent_ctx.agent
+        declared_author = agent if (agent and agent != agent_ctx.agent) else None
         slug = _slugify(title)
         rel_path = f"{scope}/{_today_iso()}-{slug}.md"
         abs_path = validate_path(rel_path, vault_root)
 
-        fm = {
+        fm: dict[str, Any] = {
             "type": "error-pattern",
             "created": _now_iso(),
             "updated": _now_iso(),
@@ -924,6 +997,8 @@ def register_tools(
             "trigger_condition": trigger_condition,
             "prevention_rule": prevention_rule,
         }
+        if declared_author is not None:
+            fm["declared_author"] = declared_author
         content = _build_frontmatter(fm) + f"\n# {title}\n\n{body}\n"
         content_hash = _sha256(content)
 
@@ -964,8 +1039,7 @@ def register_tools(
         """Create an external note in 50-external/{source}/."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "50-external"
 
         if not check_write_scope(agent_ctx, scope):
@@ -1027,8 +1101,7 @@ def register_tools(
         """Create a handoff note in 90-inbox/."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "90-inbox"
 
         if not check_write_scope(agent_ctx, scope):
@@ -1084,8 +1157,7 @@ def register_tools(
         """Append an entry to today's daily log in 20-daily/."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "20-daily"
 
         if not check_write_scope(agent_ctx, scope):
@@ -1144,8 +1216,7 @@ def register_tools(
         """Rebuild index.md for a vault folder by listing all .md files."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
 
         scope = _scope_from_path(folder)
         if not check_write_scope(agent_ctx, scope):
@@ -1195,8 +1266,7 @@ def register_tools(
         """Update an existing document (cosmetic edits only)."""
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
 
         scope = _scope_from_path(path)
         # Immutability guard: decisions/error-patterns are append-only, not editable
@@ -1266,8 +1336,7 @@ def register_tools(
         """
         t0 = time.monotonic()
         pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
-        token = await _extract_token(ctx or {})
-        agent_ctx = await authenticate(token, pool)
+        agent_ctx = await _authenticate_request(ctx, pool)
         scope = "30-decisions"
 
         if not check_write_scope(agent_ctx, scope):

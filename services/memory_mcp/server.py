@@ -1,8 +1,10 @@
 """FastMCP server for memory-mcp (write-side), default port 8767.
 
 This server intentionally mirrors the swarm-mcp pattern: an ASGI
-AuthCaptureMiddleware reads the Authorization header per HTTP request and
-publishes it into a ContextVar that tool handlers read via _extract_token.
+AuthCaptureMiddleware captures the per-request auth (Bearer string OR
+:class:`services.shared.auth.HmacAuthValue`) into a ContextVar that
+tool handlers read via ``_authenticate_request`` →
+:func:`services.shared.auth.resolve_request_identity`.
 
 There is NO environment-variable fallback for the bearer token. A missing
 or malformed Authorization header raises PermissionError → HTTP 401.
@@ -18,6 +20,7 @@ from fastmcp import FastMCP
 # Ensure parent package is importable when running as module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from services.shared.asgi_auth import HermesAwareAuthMiddleware
 from services.shared.config import Config
 from services.shared.db import close_pool, get_pool
 
@@ -69,31 +72,19 @@ async def _get_pool() -> object:
 register_tools(mcp, config.vault_root, _get_pool, tool_set=config.gbrain_tools)
 
 
-class AuthCaptureMiddleware:
-    """ASGI middleware: capture Authorization header per-request into ContextVar.
+class AuthCaptureMiddleware(HermesAwareAuthMiddleware):
+    """ASGI middleware: capture Bearer or Hermes HMAC auth into ContextVar.
 
-    Required because FastMCP stateless HTTP does not surface request headers
-    to tool handlers via ctx.request_context.request in the streamable-http
-    transport. Tool handlers read the captured value via _REQUEST_AUTH.
+    Thin compatibility subclass over :class:`HermesAwareAuthMiddleware`
+    that binds the memory-mcp ContextVar. Required because FastMCP
+    stateless HTTP does not surface request headers to tool handlers
+    via ``ctx.request_context.request`` in the streamable-http
+    transport. Tool handlers read the captured value via
+    ``_REQUEST_AUTH``.
     """
 
     def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        auth = None
-        for k, v in scope.get("headers", []):
-            if k.lower() == b"authorization":
-                auth = v.decode("latin-1")
-                break
-        token = _REQUEST_AUTH.set(auth)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            _REQUEST_AUTH.reset(token)
+        super().__init__(app, _REQUEST_AUTH)
 
 
 def main() -> None:

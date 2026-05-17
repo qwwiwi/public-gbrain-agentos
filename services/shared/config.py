@@ -95,6 +95,36 @@ def _env_float_clamped(
     return value
 
 
+def _env_bool(name: str, default: str) -> bool:
+    """Parse a boolean env var with a default.
+
+    Accepts ``1``/``0``, ``true``/``false``, ``yes``/``no`` (any case).
+    Raises :class:`RuntimeError` on any other value so misconfigurations
+    fail loudly at startup instead of silently disabling features.
+
+    Args:
+        name: Environment variable name.
+        default: Default string value used when the env var is unset.
+
+    Returns:
+        Parsed bool.
+
+    Raises:
+        RuntimeError: If the value cannot be parsed as a boolean.
+    """
+    raw = os.environ.get(name, default)
+    if raw is None:
+        raise RuntimeError(f"{name} default must be a string, got None")
+    norm = raw.strip().lower()
+    if norm in {"1", "true", "yes", "on"}:
+        return True
+    if norm in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        f"{name} must be a boolean (1/0/true/false/yes/no), got: {raw!r}"
+    )
+
+
 def _env_int(
     name: str,
     default: str,
@@ -191,6 +221,17 @@ class Config:
         default_factory=lambda: _env_float(
             "GBRAIN_SUPERSEDE_HINT", "0.70", min_value=0.0
         )
+    )
+    hmac_timestamp_tolerance_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "HMAC_TIMESTAMP_TOLERANCE_SECONDS",
+            "300",
+            min_value=1,
+            max_value=86400,
+        )
+    )
+    hmac_auth_enabled: bool = field(
+        default_factory=lambda: _env_bool("GBRAIN_HMAC_AUTH_ENABLED", "1")
     )
 
     def __post_init__(self) -> None:

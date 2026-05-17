@@ -386,11 +386,30 @@ def _capture_recall_tool(tool_set: str = "all", cache: _SpyCache | None = None):
     return recorder.tools["recall"], cache, pool
 
 
-def test_recall_cache_key_includes_agent_filter() -> None:
-    """Two recalls differing only by agent_filter must use distinct cache keys."""
-    recall_a, cache, _ = _capture_recall_tool()
-    asyncio.run(recall_a("hello", limit=5, scopes=["*"], agent_filter=None))
-    asyncio.run(recall_a("hello", limit=5, scopes=["*"], agent_filter="silvana"))
+def test_recall_cache_key_includes_agent_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two recalls differing only by agent_filter must use distinct cache keys.
+
+    Auth wiring (HMAC dual-path) requires every recall tool to authenticate
+    its caller via :func:`_resolve_reader`. This cache-key test exercises
+    pure caching semantics, so we stub authentication to a no-op fake
+    agent context rather than threading a Bearer header through.
+    """
+    from services.shared.auth import AgentContext
+
+    async def _fake_resolve(_var, _pool, **_kwargs):
+        return AgentContext(agent="silvana", write_scopes=[], read_scopes=["*"])
+
+    monkeypatch.setattr(
+        "services.recall_mcp.search.resolve_request_identity",
+        _fake_resolve,
+    )
+    tok = _REQUEST_AUTH.set("Bearer test-token")
+    try:
+        recall_a, cache, _ = _capture_recall_tool()
+        asyncio.run(recall_a("hello", limit=5, scopes=["*"], agent_filter=None))
+        asyncio.run(recall_a("hello", limit=5, scopes=["*"], agent_filter="silvana"))
+    finally:
+        _REQUEST_AUTH.reset(tok)
 
     # First two get() calls are the unique cache lookups.
     assert len(cache.get_calls) >= 2
@@ -401,25 +420,44 @@ def test_recall_cache_key_includes_agent_filter() -> None:
     assert key_filtered[3] == "silvana"
 
 
-def test_recall_cache_key_includes_source_types_sorted() -> None:
-    """Source-type order must NOT affect key; different source sets MUST differ."""
-    recall_a, cache, _ = _capture_recall_tool()
-    asyncio.run(
-        recall_a(
-            "hello", limit=5, scopes=["*"], source_types=["decision", "runbook"]
-        )
+def test_recall_cache_key_includes_source_types_sorted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-type order must NOT affect key; different source sets MUST differ.
+
+    Auth stubbed (see ``test_recall_cache_key_includes_agent_filter`` for
+    rationale — this test is about caching semantics, not auth wiring).
+    """
+    from services.shared.auth import AgentContext
+
+    async def _fake_resolve(_var, _pool, **_kwargs):
+        return AgentContext(agent="silvana", write_scopes=[], read_scopes=["*"])
+
+    monkeypatch.setattr(
+        "services.recall_mcp.search.resolve_request_identity",
+        _fake_resolve,
     )
-    asyncio.run(
-        recall_a(
-            "hello", limit=5, scopes=["*"], source_types=["runbook", "decision"]
+    tok = _REQUEST_AUTH.set("Bearer test-token")
+    try:
+        recall_a, cache, _ = _capture_recall_tool()
+        asyncio.run(
+            recall_a(
+                "hello", limit=5, scopes=["*"], source_types=["decision", "runbook"]
+            )
         )
-    )
-    asyncio.run(
-        recall_a(
-            "hello", limit=5, scopes=["*"], source_types=["decision"]
+        asyncio.run(
+            recall_a(
+                "hello", limit=5, scopes=["*"], source_types=["runbook", "decision"]
+            )
         )
-    )
-    asyncio.run(recall_a("hello", limit=5, scopes=["*"], source_types=None))
+        asyncio.run(
+            recall_a(
+                "hello", limit=5, scopes=["*"], source_types=["decision"]
+            )
+        )
+        asyncio.run(recall_a("hello", limit=5, scopes=["*"], source_types=None))
+    finally:
+        _REQUEST_AUTH.reset(tok)
 
     keys = cache.get_calls[:4]
     # Same set with different order -> identical key (so the second get() should be a hit).
@@ -439,3 +477,25 @@ def test_recall_public_signature_unchanged() -> None:
     sig = inspect.signature(recall_fn)
     params = list(sig.parameters)
     assert params == ["query", "limit", "scopes", "agent_filter", "source_types"]
+
+
+# ---------------------------------------------------------------------------
+# Hermes HMAC: _REQUEST_AUTH now holds AuthValue (str|HmacAuthValue|None)
+# ---------------------------------------------------------------------------
+def test_request_auth_accepts_hmac_value() -> None:
+    """The recall ContextVar type accepts HmacAuthValue (no isinstance gate)."""
+    from services.shared.auth import HmacAuthValue
+
+    av = HmacAuthValue(signature="sha256=00", timestamp="1700000000", body=b"x")
+    token = _REQUEST_AUTH.set(av)
+    try:
+        assert _REQUEST_AUTH.get() is av
+    finally:
+        _REQUEST_AUTH.reset(token)
+
+
+def test_resolve_reader_is_exported() -> None:
+    """``_resolve_reader`` must be importable for HMAC-aware read tools."""
+    from services.recall_mcp.search import _resolve_reader
+
+    assert callable(_resolve_reader)

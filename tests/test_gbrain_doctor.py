@@ -411,6 +411,141 @@ async def test_check_embedding_queue_huge_fail():
 
 
 # ---------------------------------------------------------------------------
+# check_hmac_secret_health
+# ---------------------------------------------------------------------------
+
+
+def _hmac_row(agent: str, secret: str) -> dict[str, str]:
+    return {
+        "agent": agent,
+        "hmac_secret_sha256": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_skip_when_no_hmac_agents():
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    # H5: env-only orphans warn even with no DB rows; pure empty env skips.
+    res = await doc.check_hmac_secret_health(conn, None)
+    assert res.status == "skip"
+    assert "no HMAC" in res.message
+    res2 = await doc.check_hmac_secret_health(conn, "{}")
+    assert res2.status == "skip"
+
+
+@pytest.mark.asyncio
+async def test_doctor_warns_on_env_agent_not_in_db():
+    """H5: env has an agent with no DB row → warn (the typo case)."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    res = await doc.check_hmac_secret_health(conn, '{"tyrand":"x"}')
+    assert res.status == "warn"
+    assert "tyrand" in res.message
+    # Must mention the no-DB-row orphan path.
+    assert "no DB row" in res.message or "unknown" in res.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_pass_when_all_match():
+    """All DB HMAC agents have matching env secrets."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(
+        return_value=[
+            _hmac_row("tyrande", "raw-secret-tyrande"),
+            _hmac_row("luna", "raw-secret-luna"),
+        ]
+    )
+    env_json = json.dumps(
+        {"tyrande": "raw-secret-tyrande", "luna": "raw-secret-luna"}
+    )
+    res = await doc.check_hmac_secret_health(conn, env_json)
+    assert res.status == "pass"
+    assert "tyrande" in res.message
+    assert "luna" in res.message
+    # The raw secret never leaks into the message.
+    assert "raw-secret-tyrande" not in res.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_warn_when_agent_missing_in_env():
+    conn = MagicMock()
+    conn.fetch = AsyncMock(
+        return_value=[
+            _hmac_row("tyrande", "raw-tyrande"),
+            _hmac_row("luna", "raw-luna"),
+        ]
+    )
+    # Only one of two agents is mounted.
+    env_json = json.dumps({"tyrande": "raw-tyrande"})
+    res = await doc.check_hmac_secret_health(conn, env_json)
+    assert res.status == "warn"
+    assert "luna" in res.message
+    assert "missing" in res.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_warn_when_env_empty():
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[_hmac_row("tyrande", "raw-tyrande")])
+    res = await doc.check_hmac_secret_health(conn, None)
+    assert res.status == "warn"
+    res2 = await doc.check_hmac_secret_health(conn, "{}")
+    assert res2.status == "warn"
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_fail_when_hash_mismatch():
+    """DB row hash and env secret hash diverge — likely rotation gap."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[_hmac_row("tyrande", "real-secret")])
+    env_json = json.dumps({"tyrande": "WRONG-stale-secret"})
+    res = await doc.check_hmac_secret_health(conn, env_json)
+    assert res.status == "fail"
+    assert "tyrande" in res.message
+    assert "mismatch" in res.message.lower()
+    # Critical: neither secret value appears anywhere in the output.
+    assert "real-secret" not in res.message
+    assert "WRONG-stale-secret" not in res.message
+    assert "rotate" in (res.remediation or "")
+
+
+@pytest.mark.asyncio
+async def test_doctor_fails_on_json_parse_error():
+    """H5: malformed env JSON fails (was warn) — silent HMAC break."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[_hmac_row("tyrande", "raw")])
+    res = await doc.check_hmac_secret_health(conn, "{not json}")
+    assert res.status == "fail"
+    assert "parse error" in res.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_fails_on_db_query_failure():
+    """H5: DB-query failure fails (was warn)."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(side_effect=RuntimeError("db down"))
+    res = await doc.check_hmac_secret_health(conn, '{"tyrande":"raw"}')
+    assert res.status == "fail"
+    assert "query failed" in res.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_check_hmac_never_prints_raw_env_secret(capsys):
+    """Render helpers must never resurrect the raw env secret."""
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[_hmac_row("tyrande", "raw-CANARY")])
+    # Mismatch path is the most likely to log details.
+    env_json = json.dumps({"tyrande": "BAD-CANARY"})
+    res = await doc.check_hmac_secret_health(conn, env_json)
+    doc.render_table([res], use_color=False)
+    doc.render_json([res])
+    out = capsys.readouterr().out
+    assert "raw-CANARY" not in out
+    assert "BAD-CANARY" not in out
+
+
+# ---------------------------------------------------------------------------
 # Exit code + render
 # ---------------------------------------------------------------------------
 

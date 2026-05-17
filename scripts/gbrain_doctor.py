@@ -499,6 +499,166 @@ def check_cron(expected: Iterable[str] | None = None) -> CheckResult:
     )
 
 
+async def check_hmac_secret_health(
+    conn: asyncpg.Connection,
+    secrets_json: str | None,
+) -> CheckResult:
+    """Verify every DB-registered HMAC agent has a matching raw secret in env.
+
+    For each ``agent_tokens`` row with ``hmac_secret_sha256 IS NOT NULL`` and
+    ``revoked_at IS NULL``, we look up the agent in the env-mounted
+    ``GBRAIN_HMAC_SECRETS_JSON={"agent":"raw_secret"}`` map and compare
+    ``sha256(raw_secret)`` against the stored hash.
+
+    Status semantics:
+      * ``skip`` — no HMAC rows in the DB (HMAC auth is opt-in, this is fine).
+      * ``pass`` — every DB HMAC agent has a matching env secret.
+      * ``warn`` — at least one DB HMAC agent is missing in env (HMAC auth
+        will fail closed for that agent; Bearer continues to work).
+      * ``fail`` — at least one env secret hashes to something other than the
+        stored value (DB and env are out of sync — likely a rotation gap).
+
+    The raw env secret is NEVER printed in any output path. Only agent names
+    and 12-char sha256 prefixes appear in the message.
+    """
+    try:
+        rows = await conn.fetch(
+            "SELECT agent, hmac_secret_sha256 FROM agent_tokens "
+            "WHERE hmac_secret_sha256 IS NOT NULL AND revoked_at IS NULL"
+        )
+    except Exception as exc:  # noqa: BLE001
+        # H5: DB query failure is fail, not warn — operator must fix
+        # connectivity before trusting any HMAC posture.
+        return CheckResult(
+            name="hmac_secret_health",
+            status="fail",
+            message=f"query failed: {exc}",
+            remediation="Verify migration 004_hmac_secrets.sql has been applied.",
+        )
+
+    # H5: parse env JSON BEFORE the no-rows short-circuit so a typo in
+    # GBRAIN_HMAC_SECRETS_JSON that orphans an env-only agent surfaces
+    # even when the DB has zero HMAC rows yet.
+    env_map: dict[str, str] = {}
+    parse_error: str | None = None
+    if secrets_json and secrets_json.strip() and secrets_json.strip() != "{}":
+        try:
+            parsed = json.loads(secrets_json)
+            if not isinstance(parsed, dict):
+                parse_error = "GBRAIN_HMAC_SECRETS_JSON must be a JSON object"
+            else:
+                # Coerce to str/str; reject non-string values silently (they
+                # cannot hash anyway). NEVER store raw values past this loop.
+                for k, v in parsed.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        env_map[k] = v
+        except json.JSONDecodeError as exc:
+            parse_error = f"GBRAIN_HMAC_SECRETS_JSON parse error: {exc.msg}"
+
+    if parse_error:
+        # H5: JSON parse failure is fail, not warn — an unparseable env
+        # means HMAC auth is silently broken for every agent.
+        return CheckResult(
+            name="hmac_secret_health",
+            status="fail",
+            message=parse_error,
+            remediation="Set GBRAIN_HMAC_SECRETS_JSON to a JSON object "
+            "mapping agent → raw secret.",
+        )
+
+    db_agents = {row["agent"] for row in rows}
+    env_agents = set(env_map)
+
+    if not rows:
+        # No DB rows. If env carries agents that have no DB row, surface
+        # that — a typo in the env key would otherwise go unnoticed.
+        unknown_in_env = sorted(env_agents)
+        if unknown_in_env:
+            return CheckResult(
+                name="hmac_secret_health",
+                status="warn",
+                message=(
+                    f"GBRAIN_HMAC_SECRETS_JSON carries {len(unknown_in_env)} "
+                    f"agent(s) with no DB row: {unknown_in_env}"
+                ),
+                remediation=(
+                    "Either run scripts/issue-hmac-secret.py for each agent, "
+                    "or remove the orphaned key(s) from GBRAIN_HMAC_SECRETS_JSON."
+                ),
+            )
+        return CheckResult(
+            name="hmac_secret_health",
+            status="skip",
+            message="no HMAC-enabled agents in agent_tokens",
+        )
+
+    missing: list[str] = []
+    mismatched: list[tuple[str, str]] = []  # (agent, stored_prefix)
+    matched: list[str] = []
+
+    for row in rows:
+        agent = row["agent"]
+        stored_hash = row["hmac_secret_sha256"]
+        raw = env_map.get(agent)
+        if raw is None:
+            missing.append(agent)
+            continue
+        # Compute sha256 of the env raw secret; NEVER log `raw` past here.
+        computed = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if computed == stored_hash:
+            matched.append(agent)
+        else:
+            mismatched.append((agent, stored_hash[:12]))
+
+    if mismatched:
+        detail = ", ".join(
+            f"{agent}(db={prefix}...)" for agent, prefix in mismatched
+        )
+        return CheckResult(
+            name="hmac_secret_health",
+            status="fail",
+            message=(
+                f"{len(mismatched)} agent(s) with hash mismatch: {detail}"
+            ),
+            remediation=(
+                "DB and env disagree — re-run "
+                "`scripts/issue-hmac-secret.py --agent <name> --rotate` "
+                "and update GBRAIN_HMAC_SECRETS_JSON, or restore the previous "
+                "env value if rotation was unintentional."
+            ),
+        )
+
+    # H5: detect orphans in BOTH directions:
+    #   - missing  = DB has agent but env does not (existing check)
+    #   - unknown_in_env = env has agent but DB does not (NEW)
+    unknown_in_env = sorted(env_agents - db_agents)
+
+    if missing or unknown_in_env:
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing in env: {sorted(missing)}")
+        if unknown_in_env:
+            parts.append(f"unknown agent(s) in env (no DB row): {unknown_in_env}")
+        return CheckResult(
+            name="hmac_secret_health",
+            status="warn",
+            message=(
+                f"matched={len(matched)}/{len(rows)}; " + "; ".join(parts)
+            ),
+            remediation=(
+                "Add missing agent(s) to GBRAIN_HMAC_SECRETS_JSON or remove "
+                "orphan key(s). Re-run `scripts/issue-hmac-secret.py --agent "
+                "<name> --rotate` if the raw secret was lost."
+            ),
+        )
+
+    return CheckResult(
+        name="hmac_secret_health",
+        status="pass",
+        message=f"{len(matched)} HMAC agent(s) healthy: {sorted(matched)}",
+    )
+
+
 async def check_embedding_queue_depth(conn: asyncpg.Connection) -> CheckResult:
     """Warn-only: count pending embedding_jobs rows."""
     try:
@@ -567,6 +727,7 @@ async def run_all_checks(args: argparse.Namespace) -> list[CheckResult]:
             "schema_tables",
             "agent_tokens",
             "bearer_mapping",
+            "hmac_secret_health",
             "embedding_queue_depth",
         ):
             results.append(
@@ -586,6 +747,12 @@ async def run_all_checks(args: argparse.Namespace) -> list[CheckResult]:
                     conn,
                     Path(args.mcp_json).expanduser(),
                     os.environ.get("TOKEN_HASH_SALT", ""),
+                )
+            )
+            results.append(
+                await check_hmac_secret_health(
+                    conn,
+                    os.environ.get("GBRAIN_HMAC_SECRETS_JSON"),
                 )
             )
         finally:

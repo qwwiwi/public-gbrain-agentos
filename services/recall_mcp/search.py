@@ -19,13 +19,64 @@ from .source_weights import SOURCE_WEIGHTS, temporal_decay
 
 logger = logging.getLogger(__name__)
 
-# Per-request Authorization header captured by ASGI middleware in server.py.
-# Workaround for FastMCP stateless HTTP not surfacing request headers to tool
-# handlers via ctx.request_context.request in some transport configs.
-# Currently read-only tools do not require authentication, but the ContextVar
-# is published so a future iteration can enforce token-scoped reads without
-# server.py changes.
-_REQUEST_AUTH: ContextVar[str | None] = ContextVar("recall_request_auth", default=None)
+# Per-request auth captured by ASGI middleware in server.py. Holds a
+# Bearer string, a HmacAuthValue, or None. Workaround for FastMCP
+# stateless HTTP not surfacing request headers via ctx.
+#
+# Recall read tools remain authenticated via :func:`_resolve_reader`
+# which dispatches between Bearer and Hermes HMAC against the same
+# ``agent_tokens`` table used by writes.
+from services.shared.auth import (  # noqa: E402  (placed here for proximity)
+    AgentContext,
+    AuthValue,
+    check_read_scope,
+    resolve_request_identity,
+    restrict_read_scopes,
+)
+
+_REQUEST_AUTH: ContextVar[AuthValue] = ContextVar("recall_request_auth", default=None)
+
+
+def _load_auth_knobs() -> tuple[int, bool]:
+    """Read ``HMAC_TIMESTAMP_TOLERANCE_SECONDS`` and the kill-switch flag.
+
+    Lightweight stand-in for ``Config`` for per-request auth — full
+    Config is constructed once at process startup, but per-request
+    auth must run without requiring PG_PASSWORD in unit tests.
+    """
+    import os as _os
+
+    raw_tol = _os.environ.get("HMAC_TIMESTAMP_TOLERANCE_SECONDS", "300")
+    try:
+        tol = int(raw_tol)
+    except (TypeError, ValueError):
+        tol = 300
+    if tol < 1:
+        tol = 300
+    elif tol > 86400:
+        tol = 86400
+
+    raw_kill = _os.environ.get("GBRAIN_HMAC_AUTH_ENABLED", "1").strip().lower()
+    hmac_enabled = raw_kill not in {"0", "false", "no", "off"}
+    return tol, hmac_enabled
+
+
+async def _resolve_reader(pool: Any) -> AgentContext:
+    """Authenticate the calling agent for a recall read tool.
+
+    Reads the captured ContextVar set by the ASGI middleware and
+    dispatches Bearer or Hermes HMAC via the shared
+    :func:`resolve_request_identity` helper, applying the operator
+    kill-switch (``GBRAIN_HMAC_AUTH_ENABLED=0``). Raises
+    :class:`PermissionError` if no valid auth is present.
+    """
+    tol, hmac_enabled = _load_auth_knobs()
+    return await resolve_request_identity(
+        _REQUEST_AUTH,
+        pool,
+        hmac_auth_enabled=hmac_enabled,
+        tolerance_seconds=tol,
+    )
 
 # RRF constant (standard value from original paper)
 _RRF_K = 60
@@ -419,6 +470,12 @@ def register_tools(
         if scopes is None:
             scopes = ["*"]
 
+        pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
+        # C3: intersect requested scopes with token read_scopes.
+        # Wildcard ["*"] only honored if token has "*".
+        scopes = restrict_read_scopes(agent_ctx, scopes)
+
         cache = get_cache_fn()
         source_key: tuple[str, ...] | None = (
             tuple(sorted(source_types)) if source_types is not None else None
@@ -435,7 +492,6 @@ def register_tools(
             logger.debug("recall cache hit: query=%s", query[:50])
             return cached
 
-        pool = get_pool_fn()
         embed_model = get_embed_fn()
 
         # Embed query
@@ -530,6 +586,12 @@ def register_tools(
             List of recent documents with path, source_type, agent, timestamps, snippet.
         """
         pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
+        # C3: gate the requested scope against the agent's read_scopes.
+        if not check_read_scope(agent_ctx, scope):
+            raise PermissionError(
+                f"Agent '{agent_ctx.agent}' cannot read scope '{scope}'"
+            )
         rows = await pool.fetch(
             """
             SELECT path, source_type, agent, created_at, updated_at,
@@ -569,14 +631,21 @@ def register_tools(
             List of related documents sorted by updated_at.
         """
         pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
 
-        # Get source document
+        # Get source document (include scope for C3 authorization check)
         doc = await pool.fetchrow(
-            "SELECT id, body, frontmatter FROM documents WHERE path = $1",
+            "SELECT id, body, frontmatter, scope FROM documents WHERE path = $1",
             path,
         )
         if doc is None:
             return []
+        # C3: target document scope must be in agent's read_scopes.
+        target_scope = doc["scope"]
+        if target_scope and not check_read_scope(agent_ctx, target_scope):
+            raise PermissionError(
+                f"Agent '{agent_ctx.agent}' cannot read scope '{target_scope}'"
+            )
 
         # Forward links: wikilinks from body + related from frontmatter
         fm = doc["frontmatter"] or {}
@@ -616,7 +685,8 @@ def register_tools(
                 doc["id"],
             )
 
-        # Deduplicate and merge
+        # Deduplicate and merge; C3: drop docs from scopes the caller
+        # cannot read so a related-by-link cannot leak across scopes.
         seen_ids: set[int] = set()
         results: list[dict[str, Any]] = []
 
@@ -624,6 +694,9 @@ def register_tools(
             if row["id"] in seen_ids:
                 continue
             seen_ids.add(row["id"])
+            row_scope = row["scope"]
+            if row_scope and not check_read_scope(agent_ctx, row_scope):
+                continue
             results.append({
                 "path": row["path"],
                 "source_type": row["source_type"],
@@ -652,6 +725,7 @@ def register_tools(
             Document dict or None if not found.
         """
         pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
         row = await pool.fetchrow(
             """
             SELECT path, frontmatter, body, source_type, agent, scope,
@@ -663,6 +737,14 @@ def register_tools(
         )
         if row is None:
             return None
+
+        # C3: enforce read_scope on the target document's scope before
+        # surfacing the body.
+        target_scope = row["scope"]
+        if target_scope and not check_read_scope(agent_ctx, target_scope):
+            raise PermissionError(
+                f"Agent '{agent_ctx.agent}' cannot read scope '{target_scope}'"
+            )
 
         return {
             "path": row["path"],
@@ -683,6 +765,7 @@ def register_tools(
             Dict with docs_per_scope, last_update, pending_jobs, total_chunks.
         """
         pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
 
         scope_rows, last_update_row, pending_row, chunks_row = await asyncio.gather(
             pool.fetch("SELECT scope, count(*) AS cnt FROM documents GROUP BY scope"),
@@ -693,7 +776,12 @@ def register_tools(
             pool.fetchrow("SELECT count(*) AS cnt FROM chunks"),
         )
 
-        docs_per_scope = {r["scope"]: r["cnt"] for r in scope_rows}
+        # C3: restrict per-scope counters to scopes the agent can read.
+        docs_per_scope = {
+            r["scope"]: r["cnt"]
+            for r in scope_rows
+            if r["scope"] is None or check_read_scope(agent_ctx, r["scope"])
+        }
         last_update = last_update_row["last_update"] if last_update_row else None
 
         return {
@@ -711,12 +799,18 @@ def register_tools(
             List of {path, db_sha256, file_sha256} for mismatched documents.
         """
         pool = get_pool_fn()
+        agent_ctx = await _resolve_reader(pool)
         vault_root = get_vault_root_fn()
 
-        rows = await pool.fetch("SELECT path, sha256 FROM documents")
+        # C3: only surface mismatches for documents in scopes the caller
+        # can read so reindex_check cannot enumerate restricted paths.
+        rows = await pool.fetch("SELECT path, sha256, scope FROM documents")
         mismatched: list[dict[str, str]] = []
 
         for row in rows:
+            row_scope = row["scope"]
+            if row_scope and not check_read_scope(agent_ctx, row_scope):
+                continue
             file_path = vault_root / row["path"]
             if not file_path.is_file():
                 mismatched.append({

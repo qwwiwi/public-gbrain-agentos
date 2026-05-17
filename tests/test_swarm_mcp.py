@@ -241,3 +241,26 @@ def test_swarm_notify_ack_always_on_both_modes(
         assert "ack" in names, (
             f"ack missing in tool_set={tool_set}; registered={names}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Hermes HMAC: _REQUEST_AUTH now holds AuthValue (str|HmacAuthValue|None)
+# ---------------------------------------------------------------------------
+def test_request_auth_accepts_hmac_value() -> None:
+    """The swarm ContextVar must round-trip HmacAuthValue without typing errors."""
+    from services.shared.auth import HmacAuthValue
+
+    av = HmacAuthValue(signature="sha256=00", timestamp="1700000000", body=b"x")
+    token = _REQUEST_AUTH.set(av)
+    try:
+        assert _REQUEST_AUTH.get() is av
+    finally:
+        _REQUEST_AUTH.reset(token)
+
+
+def test_auth_capture_middleware_uses_shared_helper() -> None:
+    """swarm AuthCaptureMiddleware subclasses HermesAwareAuthMiddleware."""
+    from services.shared.asgi_auth import HermesAwareAuthMiddleware
+    from services.swarm_mcp.server import AuthCaptureMiddleware
+
+    assert issubclass(AuthCaptureMiddleware, HermesAwareAuthMiddleware)

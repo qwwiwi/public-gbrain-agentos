@@ -4,13 +4,31 @@ Transport: HTTP POST to URL from AGENT_GATEWAYS env (JSON map {agent: url}).
 HTTP 200/2xx → mark_acked. 5xx/timeout/network → mark_retry with backoff.
 4xx (except 429) → mark as failed (permanent client error).
 Missing gateway URL for an agent → mark_retry (operator can configure later).
+
+Per-agent outbound auth (extension 2026-05-17, Hermes integration):
+- ``AGENT_GATEWAYS`` remains the existing JSON map ``{agent: url}``.
+- Optional ``AGENT_GATEWAY_AUTH`` JSON map selects auth mode per agent:
+  ``{"tyrande": "hmac:env:TYRANDE_WEBHOOK_HMAC",
+     "claude":  "bearer:env:GATEWAY_WEBHOOK_TOKEN"}``.
+  Spec ``<mode>:env:<ENV_VAR_NAME>`` resolves the secret from the named env var
+  at load time. Raw secrets must never be embedded in ``AGENT_GATEWAY_AUTH``
+  literally.
+- Agents without an explicit ``AGENT_GATEWAY_AUTH`` entry keep the legacy
+  behavior: use ``GATEWAY_WEBHOOK_TOKEN`` as a Bearer token if set, otherwise
+  send no auth header. Bearer is therefore the default for backward
+  compatibility.
+- ``GBRAIN_HMAC_OUTBOUND_ENABLED=0`` disables HMAC signing globally; targets
+  configured as HMAC are then returned as ``retry`` so they re-deliver after
+  the operator re-enables outbound HMAC.
 """
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import signal
 import sys
+from typing import Literal
 
 import httpx
 
@@ -20,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.shared.config import Config
 from services.shared.db import close_pool, get_pool
+from services.shared.hmac_sign import sign_request
 
 from . import outbox
 
@@ -36,6 +55,113 @@ BATCH_SIZE = 20
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 GATEWAY_TOKEN = os.environ.get("GATEWAY_WEBHOOK_TOKEN", "")
 COORDINATOR_AGENT = os.environ.get("COORDINATOR_AGENT", "coordinator-agent")
+
+
+@dataclasses.dataclass(frozen=True)
+class GatewayAuth:
+    """Resolved per-agent gateway auth.
+
+    Attributes:
+        mode: Auth scheme. ``"bearer"`` adds ``Authorization: Bearer <value>``,
+            ``"hmac"`` signs the body with the value as the raw secret bytes,
+            ``"none"`` sends no auth header.
+        value: Raw token (bearer) or raw secret (hmac). Empty string for
+            ``none``. Treat as sensitive — never log or include in errors.
+            ``repr=False`` so the secret does not leak via stray repr/log.
+    """
+
+    mode: Literal["bearer", "hmac", "none"]
+    value: str = dataclasses.field(repr=False)
+
+
+def _resolve_auth_spec(spec: str) -> GatewayAuth:
+    """Resolve a single ``AGENT_GATEWAY_AUTH`` value.
+
+    Supported forms:
+        ``bearer:env:VAR_NAME``  -> Bearer with value from env var
+        ``hmac:env:VAR_NAME``    -> HMAC with secret from env var
+        ``none``                 -> no auth
+
+    Unknown / empty / unresolvable specs degrade to ``GatewayAuth("none","")``.
+    The literal raw token form is intentionally NOT supported here to keep raw
+    secrets out of process arg lists / docker inspect output.
+    """
+    if not spec or not isinstance(spec, str):
+        return GatewayAuth("none", "")
+    spec = spec.strip()
+    if spec == "none":
+        return GatewayAuth("none", "")
+    parts = spec.split(":", 2)
+    if len(parts) != 3:
+        return GatewayAuth("none", "")
+    mode, source, name = parts[0].lower(), parts[1].lower(), parts[2]
+    if mode not in ("bearer", "hmac"):
+        return GatewayAuth("none", "")
+    if source != "env":
+        return GatewayAuth("none", "")
+    value = os.environ.get(name, "")
+    if not value:
+        return GatewayAuth("none", "")
+    return GatewayAuth(mode, value)  # type: ignore[arg-type]
+
+
+def _load_gateway_auth() -> dict[str, GatewayAuth]:
+    """Parse ``AGENT_GATEWAY_AUTH`` env JSON into a per-agent auth map.
+
+    Returns an empty dict if the env var is unset or malformed. Each value is
+    resolved via :func:`_resolve_auth_spec`; the returned map never carries an
+    env var NAME, only the resolved raw secret/token.
+    """
+    raw = os.environ.get("AGENT_GATEWAY_AUTH", "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        logger.error("AGENT_GATEWAY_AUTH parse failed: %s", exc)
+        return {}
+    if not isinstance(parsed, dict):
+        logger.error("AGENT_GATEWAY_AUTH is not a JSON object, ignoring")
+        return {}
+    out: dict[str, GatewayAuth] = {}
+    for agent, spec in parsed.items():
+        out[str(agent)] = _resolve_auth_spec(str(spec))
+    return out
+
+
+def _gateway_auth_for(agent: str, auth_map: dict[str, GatewayAuth]) -> GatewayAuth:
+    """Return the GatewayAuth to use for ``agent``.
+
+    Priority:
+        1. Explicit ``AGENT_GATEWAY_AUTH`` entry for the agent.
+        2. Legacy fallback: ``GATEWAY_WEBHOOK_TOKEN`` env as Bearer.
+        3. ``GatewayAuth("none", "")``.
+    """
+    if agent in auth_map:
+        return auth_map[agent]
+    if GATEWAY_TOKEN:
+        return GatewayAuth("bearer", GATEWAY_TOKEN)
+    return GatewayAuth("none", "")
+
+
+def _serialize_gateway_body(body: dict) -> bytes:
+    """Serialize a gateway webhook body to bytes exactly once.
+
+    The returned bytes are what we sign AND what we POST — using the same
+    bytes for both guarantees the verifier sees identical content. ``httpx``
+    is invoked with ``content=<bytes>`` (not ``json=``) so it does not
+    re-serialize the dict.
+    """
+    return json.dumps(body, ensure_ascii=False, sort_keys=False, separators=(",", ":")).encode("utf-8")
+
+
+def _hmac_outbound_enabled() -> bool:
+    """Whether outbound HMAC signing is globally enabled.
+
+    Default: enabled. Set ``GBRAIN_HMAC_OUTBOUND_ENABLED=0`` for emergency
+    rollback — HMAC targets then defer to retry until re-enabled.
+    """
+    return os.environ.get("GBRAIN_HMAC_OUTBOUND_ENABLED", "1") != "0"
 
 
 def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload: dict) -> str:
@@ -152,8 +278,19 @@ def _load_gateways() -> dict[str, str]:
         return {}
 
 
-async def _deliver_one(client: httpx.AsyncClient, gateways: dict[str, str], row: object) -> tuple[str, str]:
-    """Try to deliver one row. Returns (status, last_error)."""
+async def _deliver_one(
+    client: httpx.AsyncClient,
+    gateways: dict[str, str],
+    row: object,
+    auth_map: dict[str, GatewayAuth] | None = None,
+) -> tuple[str, str]:
+    """Try to deliver one row. Returns (status, last_error).
+
+    Selects per-agent auth via ``auth_map`` (resolved from ``AGENT_GATEWAY_AUTH``)
+    with a legacy ``GATEWAY_WEBHOOK_TOKEN`` Bearer fallback. The request body
+    bytes are serialized exactly once and shared between signature computation
+    (when HMAC) and the POST itself — this is the integrity invariant.
+    """
     to_agent = row["to_agent"]
     url = gateways.get(to_agent)
     if not url:
@@ -166,11 +303,22 @@ async def _deliver_one(client: httpx.AsyncClient, gateways: dict[str, str], row:
         "message": _format_virtual_prompt(row["from_agent"], to_agent, row["task_id"], payload),
         "chatId": OWNER_CHAT_ID,
     }
-    headers = {}
-    if GATEWAY_TOKEN:
-        headers["Authorization"] = f"Bearer {GATEWAY_TOKEN}"
+
+    auth = _gateway_auth_for(to_agent, auth_map or {})
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    body_bytes = _serialize_gateway_body(body)
+
+    if auth.mode == "hmac":
+        if not _hmac_outbound_enabled():
+            return "retry", f"hmac_outbound_disabled for agent={to_agent}"
+        sig_headers = sign_request(auth.value.encode("utf-8"), body_bytes)
+        headers.update(sig_headers)
+    elif auth.mode == "bearer":
+        headers["Authorization"] = f"Bearer {auth.value}"
+    # mode == "none": no auth header.
+
     try:
-        resp = await client.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT_SEC)
+        resp = await client.post(url, content=body_bytes, headers=headers, timeout=HTTP_TIMEOUT_SEC)
     except httpx.TimeoutException as exc:
         return "retry", f"timeout: {exc}"
     except httpx.HTTPError as exc:
@@ -190,9 +338,13 @@ async def run() -> None:
     pool = await get_pool(config)
     n_recovered = await outbox.bootstrap_recovery(pool)
     gateways = _load_gateways()
+    auth_map = _load_gateway_auth()
     logger.info(
-        "swarm-worker started: gateways=%s recovered=%d poll=%ds",
-        list(gateways.keys()), n_recovered, POLL_INTERVAL_SEC,
+        "swarm-worker started: gateways=%s auth_modes=%s recovered=%d poll=%ds",
+        list(gateways.keys()),
+        {a: v.mode for a, v in auth_map.items()},
+        n_recovered,
+        POLL_INTERVAL_SEC,
     )
 
     async with httpx.AsyncClient() as client:
@@ -215,7 +367,7 @@ async def run() -> None:
                         if rows:
                             logger.info("processing batch=%d", len(rows))
                         for row in rows:
-                            status, last_error = await _deliver_one(client, gateways, row)
+                            status, last_error = await _deliver_one(client, gateways, row, auth_map)
                             if status == "acked":
                                 await outbox.mark_acked(conn, row["task_id"])
                             elif status == "failed":

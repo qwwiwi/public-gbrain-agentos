@@ -12,6 +12,12 @@ from fastmcp import FastMCP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from services.shared.asgi_auth import HermesAwareAuthMiddleware
+from services.shared.auth import (
+    AuthValue,
+    authenticate_captured,
+    resolve_request_identity,
+)
 from services.shared.config import Config
 from services.shared.db import close_pool, get_pool
 from services.shared.audit import log_audit
@@ -27,32 +33,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8766
 
-# Per-request Authorization header captured by ASGI middleware.
-# Workaround for FastMCP stateless HTTP not surfacing request headers to
-# tool handlers via ctx.request_context.request in some transport configs.
-_REQUEST_AUTH: ContextVar[str | None] = ContextVar("swarm_request_auth", default=None)
+# Per-request auth captured by ASGI middleware. Holds a Bearer string,
+# a HmacAuthValue, or None. Workaround for FastMCP stateless HTTP not
+# surfacing request headers to tool handlers via ctx.request_context in
+# some transport configs.
+_REQUEST_AUTH: ContextVar[AuthValue] = ContextVar("swarm_request_auth", default=None)
 
 
-class AuthCaptureMiddleware:
-    """ASGI middleware: capture Authorization header per-request into ContextVar."""
+class AuthCaptureMiddleware(HermesAwareAuthMiddleware):
+    """ASGI middleware: capture Bearer or Hermes HMAC auth into ContextVar.
+
+    Thin compatibility subclass over :class:`HermesAwareAuthMiddleware`
+    that binds the swarm-mcp ContextVar.
+    """
 
     def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        auth = None
-        for k, v in scope.get("headers", []):
-            if k.lower() == b"authorization":
-                auth = v.decode("latin-1")
-                break
-        token = _REQUEST_AUTH.set(auth)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            _REQUEST_AUTH.reset(token)
+        super().__init__(app, _REQUEST_AUTH)
 
 
 @asynccontextmanager
@@ -99,40 +95,25 @@ async def _get_pool() -> asyncpg.Pool:
 
 
 async def _resolve_caller(ctx: Any, pool: asyncpg.Pool) -> str:
-    """Authenticate the calling agent via Bearer token. No silent fallback."""
-    import hashlib
+    """Authenticate the calling agent via Bearer token or Hermes HMAC.
 
-    # Path 1: ContextVar set by AuthCaptureMiddleware (primary).
-    auth = _REQUEST_AUTH.get() or ""
+    Delegates to :func:`services.shared.auth.resolve_request_identity`
+    which applies the operator HMAC kill-switch
+    (``GBRAIN_HMAC_AUTH_ENABLED=0``). No silent fallback to an
+    env-default identity.
 
-    # Path 2: legacy ctx.request_context (kept for compatibility / non-HTTP).
-    if not auth:
-        headers: dict[str, str] = {}
-        try:
-            if hasattr(ctx, "request_context") and ctx.request_context:
-                req = getattr(ctx.request_context, "request", None)
-                if req and hasattr(req, "headers"):
-                    headers = dict(req.headers)
-            elif isinstance(ctx, dict):
-                headers = ctx.get("headers", {})
-        except Exception:
-            headers = {}
-        auth = headers.get("authorization", headers.get("Authorization", "")) if headers else ""
-
-    token = ""
-    if auth.startswith("Bearer "):
-        token = auth[7:]
-    if not token:
-        raise PermissionError("Missing or malformed Authorization header")
-
-    h = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    row = await pool.fetchrow(
-        "SELECT agent FROM agent_tokens WHERE token_sha256 = $1 AND revoked_at IS NULL",
-        h,
+    ``ctx`` is accepted for backward-compat but no longer consulted
+    — the ContextVar is the source of truth once the ASGI middleware
+    has run.
+    """
+    config = Config(mcp_port=int(os.environ.get("MCP_PORT", str(DEFAULT_PORT))))
+    agent_ctx = await resolve_request_identity(
+        _REQUEST_AUTH,
+        pool,
+        hmac_auth_enabled=config.hmac_auth_enabled,
+        tolerance_seconds=config.hmac_timestamp_tolerance_seconds,
     )
-    if row is None:
-        raise PermissionError("Invalid or unknown bearer token")
-    return row["agent"]
+    return agent_ctx.agent
 
 
 @_gated_tool("notify")
