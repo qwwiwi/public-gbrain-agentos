@@ -1,208 +1,312 @@
 # public-gbrain-agentos
 
-> A Second Brain for your Claude Code agents, plus an optional generator for the agents themselves. Self-hosted on a single VPS. Markdown vault, hybrid recall, dual-write resilience, Telegram inbox, layered per-agent memory.
+> **Общий мозг для команды Claude Code агентов.** Self-hosted на одном VPS. Markdown vault, гибридный recall (semantic + lexical), Telegram inbox, слойная память для каждого агента, интеграция с Hermes Agent. Опционально — генератор самих агентов.
+
+---
 
 ## TL;DR
 
-Clone this repo, hand `AGENT.md` to a fresh Claude Code agent, pick **Path A** or **Path B**, answer ~8–12 questions, and 30–90 minutes later you have either (A) a working long-term memory layer fed by a Telegram bot, or (B) the same plus N personal Claude Code agent workspaces — each with layered memory and recall into the shared brain.
+Клонируй репо, передай файл `AGENT.md` свежему Claude Code агенту, выбери **Путь A** или **Путь B**, ответь на 8–12 вопросов — и через 30–90 минут у тебя:
 
-## What is this?
+- **(A)** Долговременная память для агентов, наполняемая через Telegram-бот.
+- **(B)** То же самое плюс N персональных workspace'ов Claude Code агентов, каждый со своей слойной памятью и recall'ом в общий мозг.
 
-**A Second Brain is a long-term, structured memory layer for AI agents.** Your agents stop forgetting decisions, runbooks, error patterns, and external sources between sessions. Instead of dumping context into ever-longer prompts, agents write to and recall from a shared markdown vault.
+---
 
-**Plus, optionally, the agents themselves.** The `agent-template/` directory in this repo is a complete generator for Claude Code agent workspaces with layered memory (hot/warm/cold), Stop/SessionStart/PreCompact hooks, and `.mcp.json` wired to your brain. One install command per agent. Run it as many times as you need agents.
+## Что такое «общий мозг»?
 
-**Who it is for.** Solo builders and small teams running multiple Claude Code agents (a coordinator, a coder, a reviewer, a researcher) who want them to share institutional memory. If you have one agent and a 200k context window covers your work, you probably want Path A (brain only). If you have three agents and they keep stepping on each other's decisions, you want Path B (brain + workspaces).
+**Общий мозг (Second Brain) — это структурированный слой долговременной памяти для AI-агентов.** Без него каждая сессия Claude Code забывает решения, ранбуки, ошибки и внешние источники. С ним — агенты пишут в общий markdown-vault и достают оттуда контекст вместо того чтобы раздувать промпт до 200k токенов.
 
-## Two paths
+**Плюс — генератор самих агентов (опционально).** Папка `agent-template/` в репо — полный генератор Claude Code workspace'ов со слойной памятью (hot/warm/cold), hooks (Stop / SessionStart / PreCompact) и `.mcp.json`, уже подключённым к твоему мозгу. Одна команда — один агент. Запускай столько раз, сколько агентов нужно.
 
-| | Path A — Minimal | Path B — Full stack |
+**Для кого:** одиночные строители и небольшие команды, которые крутят 2+ Claude Code агентов (координатор, кодер, ревьюер, ресёрчер) и хотят чтобы они делили общую институциональную память.
+
+- 1 агент, контекста 200k хватает → бери **Путь A** (только мозг).
+- 3+ агента наступают друг другу на хвосты по решениям → **Путь B** (мозг + workspace'ы).
+
+---
+
+## Два пути установки
+
+| | Путь A — минимальный | Путь B — полный стек |
 |---|---|---|
-| What you ship | Shared brain (VPS) + Telegram inbox-agent | Brain + inbox-agent + N personal agent workspaces |
-| Install time | ~30 min | ~60–90 min (10 min per extra agent) |
-| Best for | Archiving forwards, daily digests, recall API to wire up later by hand | Multi-agent teams that share one brain, layered per-agent memory |
-| Uses `agent-template/`? | No | Yes |
-| You get | A searchable markdown vault fed by Telegram forwards, hybrid recall over MCP, daily digest | Same as A, plus 1+ Claude Code workspaces at `~/.claude-lab/<agent-id>/.claude/` with their own SOUL, rules, decisions log, hot handoff, hooks, memory-rotation crons, and MCP recall into the shared brain |
+| Что устанавливается | Общий мозг (VPS) + Telegram inbox-agent | Мозг + inbox-agent + N персональных workspace'ов |
+| Время | ~30 мин | ~60–90 мин (+10 мин на каждого доп. агента) |
+| Кому | Архив форвардов из Telegram, daily digest, recall API под ручное использование | Команды агентов с общей памятью, у каждого своя слойная память |
+| Использует `agent-template/`? | Нет | Да |
+| Результат | Markdown-vault с поиском, daily digest, recall через MCP | Всё от A + N workspace'ов `~/.claude-lab/<agent-id>/.claude/` с собственным SOUL, rules, decisions, hot handoff, hooks, cron-ротацией памяти и `.mcp.json` |
 
-If unsure → start with Path A. Adding Path B later is one command per agent (`bash agent-template/install.sh`).
+Не уверен → начни с **A**. Добавить B потом — одна команда на агента: `bash agent-template/install.sh`.
 
-## What you get after install
+---
 
-| Component | Path A | Path B |
+## Что ты получаешь после установки
+
+| Компонент | Путь A | Путь B |
 |---|---|---|
-| Postgres 16 + pgvector on VPS | yes | yes |
-| 3 MCP services (memory write, recall read, swarm event bus) | yes | yes |
-| Ingest worker (embeds new vault files) | yes | yes |
-| Markdown vault (12 numbered folders) | yes | yes |
-| Telegram inbox-agent (dual-write to local raw/ + brain) | yes | yes |
-| Daily digest cron (09:00) + compile cron (every 15 min) | yes | yes |
-| Optional ingestion skills (YouTube, IG, X, voice, web) | yes | yes |
-| One Bearer token per agent identity in `agent_tokens` | 2 by default (`coordinator-agent`, `inbox-agent`) | 2 + 1 per personal agent |
-| Personal Claude Code workspace(s) at `~/.claude-lab/<agent-id>/.claude/` | no | yes (N of them) |
-| Layered memory per workspace (CLAUDE.md / rules.md / decisions.md / handoff.md → MEMORY.md / LEARNINGS.md / TOOLS.md on demand) | no | yes |
-| Stop / SessionStart / PreCompact hooks per workspace | no | yes |
-| Memory-rotation crons (hot → warm, warm → cold, compress old warm) | no | yes (one set per workspace) |
-| `.mcp.json` per workspace, pre-wired to the brain | no | yes |
+| Postgres 16 + pgvector на VPS | ✅ | ✅ |
+| **4 MCP сервиса** (memory write, recall read, swarm event bus, tasks coordination) | ✅ | ✅ |
+| Ingest worker (эмбеддит новые файлы vault'а) | ✅ | ✅ |
+| Markdown vault (12 пронумерованных папок) | ✅ | ✅ |
+| Telegram inbox-agent (dual-write в local raw/ + brain) | ✅ | ✅ |
+| Daily digest cron (09:00) + compile cron (каждые 15 мин) | ✅ | ✅ |
+| Опциональные ingestion skills (YouTube, IG, X, voice, web) | ✅ | ✅ |
+| Bearer токен на каждую идентичность в `agent_tokens` | 2 по умолчанию | 2 + 1 на каждого персонального агента |
+| **HMAC-аутентификация для Hermes Agent** (опционально) | ✅ | ✅ |
+| Персональный Claude Code workspace `~/.claude-lab/<agent-id>/.claude/` | ❌ | ✅ (N штук) |
+| Слойная память (CLAUDE.md / rules.md / decisions.md / handoff.md → MEMORY.md / LEARNINGS.md / TOOLS.md по запросу) | ❌ | ✅ |
+| Stop / SessionStart / PreCompact hooks | ❌ | ✅ |
+| Cron-ротация памяти (hot → warm → cold) | ❌ | ✅ |
+| `.mcp.json` каждого workspace'а, уже подключённый к мозгу | ❌ | ✅ |
 
-## Architecture
+---
+
+## Архитектура
 
 ```
-   You forward content                         Your agents recall
-   to a Telegram bot              <-->         and write decisions
+   Ты форвардишь контент                    Твои агенты достают
+   в Telegram-бот               <-->         и пишут решения
            |                                            |
            v                                            v
   +----------------+                          +-------------------+
   |  inbox-agent   |---------HTTPS / TS-------|       VPS         |
-  |  (local)       |                          |                   |
+  |  (локально)    |                          |                   |
   |  dual-writes   |                          |  Caddy (TLS)      |
-  |  to local raw/ |                          |  memory_mcp 8767  |
-  |  AND remote    |                          |  recall_mcp 8768  |
+  |  в local raw/  |                          |  memory_mcp 8767  |
+  |  И в remote    |                          |  recall_mcp 8768  |
   +----------------+                          |  swarm_mcp  8766  |
-          ^                                   |  ingest-worker    |
-          |                                   |                   |
-  +-------+-------------+ (Path B)            |  Postgres 16      |
-  |  Personal agents    |--------HTTPS/TS---->|  + pgvector       |
+          ^                                   |  task_mcp   8769  |
+          |                                   |  ingest-worker    |
+  +-------+-------------+ (Путь B)            |                   |
+  |  Персональные       |--------HTTPS/TS---->|  Postgres 16      |
+  |  агенты             |                     |  + pgvector       |
   |  ~/.claude-lab/     |                     |  + FTS            |
   |  <agent-id>/.claude |                     |                   |
   |  + hot/warm/cold    |                     |  vault/ (12 dirs) |
   |  + Stop/Session/    |                     +-------------------+
-  |    PreCompact hooks |
-  |  + .mcp.json        |
-  +---------------------+
+  |    PreCompact hooks |                              ^
+  |  + .mcp.json        |                              |
+  +---------------------+                              |
+                                       Hermes Agent ---+
+                                       (опционально,
+                                        HMAC-подпись)
 ```
 
-Every agent has a Bearer token. Every write is scoped (an `inbox-agent` cannot write decisions). Every retrieval combines semantic (1024-dim FastEmbed multilingual embeddings) and lexical (Postgres FTS) search, fused with Reciprocal Rank Fusion, re-weighted by source kind and recency.
+**4 MCP сервиса:**
 
-The vault is plain markdown on a filesystem. Postgres is an index over it, not the source. If you lose the database, you re-embed from markdown in 5 minutes. If you lose the vault, you have a problem — back it up.
+1. **`memory_mcp`** (порт 8767) — пишет в vault. Тулзы: создание decisions, runbooks, error-patterns, daily logs, external notes. Каждая запись через scoped Bearer (inbox-agent не может писать decisions).
+2. **`recall_mcp`** (порт 8768) — гибридный поиск. Семантика (1024-dim FastEmbed multilingual embeddings) + лексика (Postgres FTS), слитые через Reciprocal Rank Fusion, re-weighted по типу источника и свежести.
+3. **`swarm_mcp`** (порт 8766) — шина событий между агентами. Inbox, notify, ack, broadcast, escalate.
+4. **`task_mcp`** (порт 8769) — координация задач. State machine `new → progress → review → done` (+ `blocked`), task_history, agent heartbeat с metadata.
 
-In Path B, each personal agent's workspace is **also** plain markdown (its SOUL, rules, decisions, handoff). Each workspace is self-contained — you can `tar` it up, move it to another machine, point it at the same brain, and resume.
+**Идентичность:** у каждого агента собственный Bearer-токен в таблице `agent_tokens` со scope'ами read/write. AuthCaptureMiddleware (ASGI) кладёт identity в ContextVar — без silent fallback на «default agent» (исправлено в инцидентах identity-fix 2026-05-09/16).
+
+**Vault — каноничен.** Plain markdown на файловой системе. Postgres — индекс, не источник. Потерял БД → переэмбеддил из markdown за 5 минут. Потерял vault → проблема — делай бэкап.
+
+В Путь B каждый persональный workspace **тоже** plain markdown (SOUL, rules, decisions, handoff). Можно `tar`-нуть, перенести на другую машину, направить на тот же мозг и продолжить.
+
+---
+
+## Интеграция с Hermes Agent
+
+Если ты крутишь [Hermes Agent](https://github.com/NousResearch/hermes-agent) (или подобный фреймворк, который подписывает запросы по HMAC-схеме `<timestamp>.<body>`), `public-gbrain-agentos` поддерживает обе схемы аутентификации одновременно — **Bearer и HMAC** — через общий middleware. Без правки самого Hermes.
+
+### Как работает
+
+- В таблице `agent_tokens` у агента есть оба поля: `token_sha256` (для Bearer) и `hmac_secret_sha256` (для HMAC). Любое можно `NULL` — один из двух обязателен.
+- ASGI middleware `services/shared/asgi_auth.py` (`HermesAwareAuthMiddleware`) читает один из двух заголовков:
+  - `Authorization: Bearer <token>` — стандартный путь
+  - `X-Hermes-Signature: sha256=<hex>` + `X-Hermes-Timestamp: <unix>` — HMAC-путь
+- HMAC проверяется constant-time (`hmac.compare_digest`), timestamp tolerance — 5 минут (настраивается через `HMAC_TIMESTAMP_TOLERANCE_SECONDS`).
+- Identity-проверка одна и та же: scope-based RBAC через `agent_tokens.can_write_scopes` / `can_read_scopes`.
+
+### Sidecar proxy для клиентов, которые не умеют HMAC
+
+Hermes выпускает MCP tool-calls без HMAC-подписи. Чтобы не патчить Hermes, в репо есть `scripts/hermes_signed_proxy.py` (Starlette + httpx + uvicorn):
+
+```
+Hermes → http://localhost:9100/{memory,recall,swarm,task}/mcp
+              ↓ proxy подписывает каждый запрос
+              ↓ X-Hermes-Signature: sha256=...
+              ↓ X-Hermes-Timestamp: <now>
+              ↓
+         https://gbrain.example.com/{memory,recall,swarm,task}/mcp
+```
+
+Запуск: `python scripts/hermes_signed_proxy.py --listen 0.0.0.0:9100 --upstream https://gbrain.example.com --secret-env GBRAIN_HMAC_SECRET --agent <agent-id>`.
+
+### Выпуск HMAC-секрета
+
+```bash
+python scripts/issue-hmac-secret.py --agent <agent-id>
+# Печатает raw HMAC secret ОДИН РАЗ в stdout, sha256 сохраняется в БД.
+# Скопируй secret в безопасное хранилище — больше его получить нельзя.
+```
+
+Полный walkthrough + примеры подписания: `docs/hermes-integration.md`.
+
+---
 
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-fork>/public-gbrain-agentos.git
+git clone https://github.com/<твой-форк>/public-gbrain-agentos.git
 cd public-gbrain-agentos
-# Open Claude Code in this directory, then:
-# "Read AGENT.md. I want Path A." (or "Path B with a coordinator and a coder")
+# Открой Claude Code в этой папке, затем скажи агенту:
+# «Прочитай AGENT.md. Путь A.» (или «Путь B с координатором и кодером»)
 ```
 
-That is it. The agent reads `AGENT.md`, asks you for VPS access + a few config inputs, runs the install scripts, issues tokens, configures the local inbox bot, and (Path B) runs `agent-template/install.sh` once per personal agent. It runs an end-to-end smoke test before declaring done.
+Готово. Агент читает `AGENT.md`, спрашивает у тебя VPS-доступ + несколько конфиг-параметров, запускает install-скрипты, выпускает токены, настраивает локального inbox-бота, и (Путь B) запускает `agent-template/install.sh` по разу на каждого персонального агента. В конце прогоняет end-to-end smoke test.
 
-If you would rather install by hand, read `docs/setup.md` — it is the same steps written for humans.
+Хочешь руками — читай `docs/setup.md`, там те же шаги в человеческом виде.
 
-## What is in this repo
+---
+
+## FAQ
+
+**Зачем мне общий мозг, если у Claude Code есть memory tool?**
+Memory tool — сессионная, теряется при `/clear` или reset контекста. Общий мозг — на диске, не зависит от сессии, делится между агентами, поддерживает поиск (semantic+lexical), backup, версионирование (vault — это git-friendly markdown).
+
+**Можно без Telegram?**
+Да. Telegram inbox — опциональный путь наполнения. Без него мозг работает как recall-API: агенты пишут decisions/runbooks через `memory_mcp` и достают через `recall_mcp`.
+
+**Можно ли мозг без vault'а?**
+Нет. Vault — источник правды. Postgres — только индекс.
+
+**Что если я не знаю Postgres / Linux / VPS?**
+Установка автоматизирована — Claude Code агент по `AGENT.md` сам выполнит SSH-команды, миграции, выпуск токенов. Тебе нужны: SSH-ключ, доступ к Ubuntu 22.04 VPS (например, Hetzner CPX42 — 4 vCPU / 8 GB RAM), и Claude Code локально.
+
+**Hermes интеграция обязательна?**
+Нет. Если не нужен Hermes — пропусти. Bearer-аутентификации хватит для Claude Code.
+
+**Можно использовать с другими AI-фреймворками (LangChain, AutoGen)?**
+Да, любой MCP-совместимый клиент может ходить в `memory_mcp` / `recall_mcp` / `swarm_mcp` / `task_mcp`. Для non-MCP клиентов есть HTTP JSON-RPC endpoint.
+
+**Сколько стоит держать?**
+VPS Hetzner CPX42 ~16€/мес. Telegram-бот бесплатный. Опциональные API (Groq Whisper, HikerAPI, Perplexity) — по своим тарифам, и нужны только если включишь соответствующий ingestion skill.
+
+**Я могу форкать и менять под себя?**
+Apache 2.0 license. Форкай, меняй, переделывай. Если найдёшь баг или сделаешь полезный feature — PR в upstream приветствуется.
+
+---
+
+## Что в репо
 
 ```
 public-gbrain-agentos/
-  AGENT.md                main entry — fed into Claude Code agent
-  README.md               this file
+  AGENT.md                главный вход — кормишь Claude Code агенту
+  README.md               этот файл
   LICENSE                 Apache 2.0
-  .env.example            all env vars commented by section
+  .env.example            все env-переменные с комментариями
   .gitignore
-  pyproject.toml          package metadata + deps
-  requirements.txt        pinned versions
+  pyproject.toml          метаданные пакета + зависимости
+  requirements.txt        зафиксированные версии
 
   docs/
-    architecture.md       how the system works (deep dive, incl. agent workspace layer)
-    setup.md              manual install, step-by-step (Path A + Path B)
-    security.md           threat model, token rotation, exposure rules
-    troubleshooting.md    FAQ for common errors (incl. agent-template entries)
+    architecture.md       глубокое погружение в систему
+    setup.md              ручная установка step-by-step (Путь A + Путь B)
+    security.md           threat model, ротация токенов, exposure rules
+    troubleshooting.md    FAQ по типичным ошибкам
+    hermes-integration.md walkthrough Hermes Agent + HMAC + sidecar proxy
+    task-mcp-integration.md tasks/agents heartbeat operator guide
 
   services/
-    shared/               auth, db, audit, config
+    shared/               auth, db, audit, config, hmac_sign, asgi_auth
     memory_mcp/           write API (AuthCaptureMiddleware)
     recall_mcp/           read API (hybrid search)
-    swarm_mcp/            event bus for inter-agent messages
-    ingest_worker/        watches embedding_jobs, embeds new chunks
+    swarm_mcp/            event bus межагентных сообщений
+    task_mcp/             координация задач (13 MCP tools)
+    ingest_worker/        embeds новых chunks
 
-  migrations/             schema (SQL)
+  migrations/             SQL-схема (001-006)
   tests/                  pytest, smoke + unit
 
-  vault-template/         12 folders + READMEs + note templates
+  vault-template/         12 папок + READMEs + шаблоны нот
                           (10-strategy, 20-daily, 30-decisions, ...)
 
-  inbox-agent/            local bot + dual-write hook + cron scripts
+  inbox-agent/            локальный бот + dual-write hook + cron'ы
 
-  agent-template/         (Path B only) generator for personal agent workspaces
-    install.sh            interactive: prompts for agent id, role, owner,
-                          MCP host, model — produces a full workspace
-    templates/            *.template files for CLAUDE.md, rules.md,
-                          mcp.json, USER.md, decisions.md, etc.
+  agent-template/         (только Путь B) генератор персональных workspace'ов
+    install.sh            интерактивный: спрашивает agent id, role, owner,
+                          MCP host, model — даёт готовый workspace
+    templates/            *.template для CLAUDE.md, rules.md, mcp.json,
+                          USER.md, decisions.md
     scripts/              memory-rotate.sh, trim-hot.sh, rotate-warm.sh,
                           compress-warm.sh, gbrain-recall-on-start.sh
     hooks/                stop-hook.sh, session-start-hook.sh,
                           precompact-hook.sh
     docs/                 ARCHITECTURE.md, MEMORY.md, HOOKS.md,
-                          MULTI-AGENT.md, TOKEN-OPTIMIZATION.md,
-                          SETUP-GUIDE.md
+                          MULTI-AGENT.md, TOKEN-OPTIMIZATION.md
 
-  skills/                 optional ingestion skills (YouTube, IG, X, ...)
-
-  caddy/                  Caddyfile template (TLS, optional)
-  systemd/                unit file templates
+  skills/                 опциональные ingestion skills
+  caddy/                  Caddyfile template (TLS)
+  systemd/                unit-файлы
   scripts/                install, smoke-test, sanitize-check,
-                          issue-agent-token, migrate
+                          issue-agent-token, issue-hmac-secret,
+                          hermes_signed_proxy, gbrain_doctor
 ```
 
-## Requirements
+---
 
-**On the VPS (both paths):**
+## Требования
 
-- Ubuntu 22.04 LTS (other Ubuntu/Debian versions are untested)
-- 4 vCPU, 8 GB RAM minimum (recall on 50k+ vault files needs the RAM)
-- 20 GB disk (vault + Postgres + embeddings)
-- SSH access (key-based auth)
-- Optional: a domain with an A record pointing at the VPS, for TLS via Caddy. Without a domain, the system is reachable over Tailscale or SSH tunnels.
+**На VPS (оба пути):**
+- Ubuntu 22.04 LTS
+- 4 vCPU, 8 GB RAM (recall на 50k+ файлах требует RAM)
+- 20 GB диск (vault + Postgres + эмбеддинги)
+- SSH-доступ (key-based)
+- Опционально: домен с A-record на VPS для TLS через Caddy. Без домена — через Tailscale или SSH-туннели.
 
-**On your local workstation (both paths):**
-
-- macOS, Linux, or WSL on Windows
-- Claude Code installed (`claude` CLI), authenticated via Anthropic Max or a comparable plan that allows agent runs
+**Локально (оба пути):**
+- macOS, Linux или WSL на Windows
+- Claude Code CLI (`claude`), Anthropic Max или аналогичный план
 - Python 3.11+
-- `crontab` available (default on Mac/Linux)
-- Tailscale (optional, if not using a public domain)
+- `crontab` (по умолчанию на Mac/Linux)
+- Tailscale (опционально, если без публичного домена)
 
-**Additionally for Path B:**
+**Дополнительно для Путь B:**
+- Папка `~/.claude-lab/<agent-id>/` на каждого агента (install-скрипт создаёт)
+- Возможность запустить Claude Code с project-флагом (`claude --project ~/.claude-lab/<agent-id>/.claude`)
+- Per-workspace crontab entries (install добавляет 3 строки на агента)
 
-- One directory per agent under `~/.claude-lab/<agent-id>/` (the install script creates them; just make sure the parent is writable and you have ~15 MB free per agent before any logs accumulate).
-- Ability to launch Claude Code with a project flag (e.g. `claude --project ~/.claude-lab/<agent-id>/.claude`) — most current CLI versions support this.
-- Per-workspace crontab entries (the install adds three lines per agent for memory rotation; if you already run a crowded crontab, plan accordingly).
+**Аккаунты:**
+- Telegram-аккаунт (для общения с inbox-ботом)
+- Telegram-бот от `@BotFather` (бесплатно, 60 секунд). Один бот на агента — токены никогда не шарятся.
 
-**Accounts (both paths):**
-
-- A Telegram account (to talk to your inbox bot).
-- A Telegram bot from `@BotFather` (free, 60 seconds to set up). One bot per agent that needs Telegram reachability — never share tokens between bots.
-
-**Optional API keys** (only needed if you enable the corresponding ingestion skill):
-
-- Groq — Whisper transcription of voice notes
-- HikerAPI — Instagram caption and metadata extraction
-- TranscriptAPI — YouTube transcript fetching
-- SocialData — X/Twitter thread reading
+**Опциональные API-ключи** (только если включишь соответствующий ingestion skill):
+- Groq — Whisper-транскрипция голосовых
+- HikerAPI — Instagram captions
+- TranscriptAPI — YouTube транскрипты
+- SocialData — X/Twitter
 - Perplexity — web research
 
-You do not need any of these to start. Enable them later by editing `${INBOX_AGENT_HOME}/.env` and restarting the bot.
+---
 
-## What this is NOT
+## Что это НЕ
 
-- Not a multi-tenant SaaS. One vault per VPS, one user (or small team) per vault.
-- Not a chat UI. There is no web frontend. The vault is markdown, recall is an MCP API, the bot is for inbox capture.
-- Not a replacement for your agent's session context. It is long-term memory; short-term still belongs in the prompt.
-- Not a vector database product. The Postgres + pgvector + FTS combination is intentional — markdown stays canonical, the index is recomputable.
-- Not battle-tested at scale. Designed for solo/small-team usage with vaults up to ~100k notes and up to ~10 personal agents per brain.
-- Not a replacement for your IDE. Path B workspaces are agent home directories, not project repos. You still write your code wherever you write code.
+- Не multi-tenant SaaS. Один vault на VPS, один пользователь (или маленькая команда) на vault.
+- Не chat UI. Нет web-фронтенда. Vault — markdown, recall — MCP API, бот — для inbox-capture.
+- Не замена сессионного контекста. Это **долговременная** память; короткая всё ещё в промпте.
+- Не vector database product. Postgres + pgvector + FTS — намеренный выбор: markdown остаётся каноничен, индекс пересчитываемый.
+- Не battle-tested at scale. Дизайн под solo/small team — vault до ~100k нот, до ~10 персональных агентов на мозг.
+- Не замена IDE. Workspace'ы Путь B — home-папки агентов, не репозитории проектов.
+
+---
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+Apache License 2.0. Полный текст в [LICENSE](LICENSE).
+
+---
 
 ## Acknowledgements
 
-- **FastMCP** — the Python MCP framework that powers the three service skeletons.
-- **FastEmbed** — embedding library, used for the multilingual-e5-large model (1024 dims, runs on CPU).
-- **pgvector** — Postgres extension for vector storage and HNSW indexing.
+- **FastMCP** — Python MCP framework, на нём построены 4 сервиса.
+- **FastEmbed** — embedding library, multilingual-e5-large (1024 dims, на CPU).
+- **pgvector** — Postgres-расширение для векторов и HNSW-индексов.
 - **Caddy** — TLS reverse proxy.
-- The `agent-template/` directory is a merged port of [`qwwiwi/public-architecture-claude-code`](https://github.com/qwwiwi/public-architecture-claude-code) — the universal Claude Code workspace generator with layered memory and hooks. The brain-side MCP wiring is added on top so each generated workspace plugs directly into the gbrain shipped by this repo.
-- The vault folder convention (12 numbered scopes for daily, decisions, runbooks, error-patterns, etc.) is inspired by PARA, Zettelkasten, and the Cognee project's note structure.
+- **Hermes Agent** ([NousResearch](https://github.com/NousResearch/hermes-agent)) — фреймворк, под который сделана HMAC-схема и sidecar proxy. Сам Hermes мы не патчим — `gbrain` адаптирован под его публичный контракт.
+- `agent-template/` — порт из [`qwwiwi/public-architecture-claude-code`](https://github.com/qwwiwi/public-architecture-claude-code). Поверх добавлено MCP-подключение к gbrain.
+- Структура vault'а (12 пронумерованных scope'ов) вдохновлена PARA, Zettelkasten и проектом Cognee.
 
-Contributions, bug reports, and forks welcome. Open an issue or PR on the upstream repo.
+Контрибуции, баг-репорты и форки приветствуются. Открывай issue или PR в upstream-репо.
