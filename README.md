@@ -26,6 +26,36 @@
 
 ---
 
+## Что умеет gbrain
+
+| Возможность | Что это значит на практике |
+|---|---|
+| **Persistent vault** | Plain markdown на диске VPS. 12 scope'ов (10-strategy, 20-daily, 30-decisions, 40-learnings, 50-external, 60-handoff, 70-runbooks, 80-error-patterns, 90-inbox, 95-artifacts, 99-archive). Не теряется при `/clear`, `/compact` или смерти сессии. |
+| **Гибридный recall** | Семантический поиск (FastEmbed multilingual-e5-large, 1024-dim) + лексический FTS (Postgres tsvector), слиты через Reciprocal Rank Fusion, переранжированы по типу и свежести. Один MCP-вызов `recall(query, limit=N)` — получаешь top-N релевантных markdown'ов с метаданными. |
+| **Scoped write API** | 5 типов нот: decisions, runbooks, error-patterns, daily logs, external. Каждая идёт в свою папку с frontmatter, sha256-дедупликацией и audit_log. Scope-based RBAC: inbox-agent не может писать decisions, coder не может писать в archive. |
+| **Inter-agent шина** | swarm_mcp: notify, list_my_pending, ack, broadcast, escalate. Любой агент может разбудить другого через payload + Bearer (или через webhook → gateway → новая Claude-сессия запускается автоматически). |
+| **Tasks state machine** | task_mcp: `new → progress → review → done` (+ `blocked`). task_history (audit trail), agent heartbeat с metadata (host/role/model/version). 13 MCP-тулов покрывают весь жизненный цикл. |
+| **Identity и audit** | Каждый агент — Bearer-токен в `agent_tokens` (sha256 stored, raw printed once). ASGI middleware `AuthCaptureMiddleware` кладёт identity в ContextVar — no silent fallback. Каждая запись logged в `audit_log` с `agent`, `action`, `timestamp`, `payload_sha256`. |
+| **HMAC dual-auth** | Параллельный путь аутентификации для Hermes Agent: `X-Hermes-Signature` + `X-Hermes-Timestamp` поверх HMAC-SHA256(`<timestamp>.<body>`). Constant-time compare, 5-минутный tolerance. Same scopes, same RBAC. |
+| **Telegram inbox** | Локальный бот пересылает форварды + voice + ссылки в vault с dual-write (raw/ локально для приватного, brain удалённо для retrievable). Daily digest cron в 09:00. Voice → Groq Whisper транскрипт → markdown. |
+| **Memory hooks (Путь B)** | Stop hook записывает каждую сессию в `hot/recent.md`. SessionStart hook поднимает топ-N последних entries в context window. PreCompact hook сохраняет summary до автокомпакта Claude Code. Cron-ротация `hot → warm → cold` (14 дней TTL). |
+| **Agent generator (Путь B)** | `agent-template/install.sh` — один Bash-скрипт спрашивает 8 параметров (agent id, role, owner, MCP host, model, ...) и собирает полный Claude Code workspace со слойной памятью и `.mcp.json` уже подключённым к мозгу. Запускай столько раз, сколько агентов нужно. |
+
+---
+
+## Какие проблемы это решает
+
+1. **«Агент забывает всё после /clear или /compact».** Сессионная память Claude Code эфемерна. gbrain пишет на диск, recall достаёт обратно. Можно `/clear` без потерь.
+2. **«У меня 3 агента и они дублируют работу».** Без общей памяти координатор не знает что кодер уже решил, ревьюер не видит decision rationale. Через recall_mcp любой агент видит ноты всех остальных.
+3. **«Промпт раздулся до 150k токенов от истории».** Lazy retrieval вместо eager context: держи в промпте только активную задачу, добирай decisions/runbooks через recall по запросу.
+4. **«Identity подменяется на default agent».** Системы которые ходят через один service-account API ключ не могут различать кто что записал. Здесь — per-agent Bearer + audit_log с привязкой к identity, нельзя замаскироваться.
+5. **«Inter-agent коммуникация на bash-скриптах и Firebase RTDB».** Coordination через MCP с outbox state machine, idempotent retry, scope-based delivery. Не нужен Firebase / Redis / RabbitMQ — Postgres хватает.
+6. **«Hermes/MiniMax/локальная модель не умеет Bearer».** HMAC-путь + sidecar proxy решают это без патчинга самого Hermes — gbrain адаптирован под публичный контракт фреймворка.
+7. **«Backup vault'а — это бэкап БД с эмбеддингами».** Не нужно: markdown остаётся каноничен. Потерял Postgres → reindex из vault'а за 5 минут. Потерял vault → восстанавливаешь из git/tar.
+8. **«Vendor lock-in на векторной БД».** pgvector + FTS — стандартный Postgres, не Pinecone/Weaviate/Qdrant. Миграция = `pg_dump`.
+
+---
+
 ## Два пути установки
 
 | | Путь A — минимальный | Путь B — полный стек |
@@ -107,11 +137,91 @@
 
 ---
 
-## Интеграция с Hermes Agent
+## Интеграция с агентами
 
-Если ты крутишь [Hermes Agent](https://github.com/NousResearch/hermes-agent) (или подобный фреймворк, который подписывает запросы по HMAC-схеме `<timestamp>.<body>`), `public-gbrain-agentos` поддерживает обе схемы аутентификации одновременно — **Bearer и HMAC** — через общий middleware. Без правки самого Hermes.
+gbrain — это **MCP-сервер**, не закрытая платформа. Любой фреймворк, говорящий по протоколу Model Context Protocol (или умеющий слать HTTP+JSON-RPC), подключается напрямую. Ниже — четыре пути для самых распространённых стеков.
 
-### Как работает
+| Фреймворк | Транспорт | Auth | Setup time |
+|---|---|---|---|
+| Claude Code | MCP streamable-http (нативно) | Bearer | ~2 мин |
+| Openclaw | MCP streamable-http (нативно) | Bearer | ~5 мин |
+| Codex (OpenAI CLI) | MCP streamable-http (нативно) | Bearer | ~3 мин |
+| Hermes Agent | HTTP JSON-RPC через sidecar | HMAC `<timestamp>.<body>` | ~10 мин |
+
+---
+
+### Claude Code
+
+Нативный путь. Claude Code поддерживает MCP через `.mcp.json` в корне workspace'а — выпустил Bearer, добавил 4 сервера, и тулзы появляются в context window сами.
+
+1. Выпусти токен на сервере: `python scripts/issue-agent-token.py --agent <agent-id> --scopes read,write` — печатает raw Bearer **один раз**.
+2. Добавь в `~/.claude-lab/<agent-id>/.claude/.mcp.json`:
+
+   ```json
+   {
+     "mcpServers": {
+       "gbrain-memory": {
+         "type": "http",
+         "url": "https://gbrain.example.com/memory/mcp",
+         "headers": {"Authorization": "Bearer <RAW_TOKEN>"}
+       },
+       "gbrain-recall": {
+         "type": "http",
+         "url": "https://gbrain.example.com/recall/mcp",
+         "headers": {"Authorization": "Bearer <RAW_TOKEN>"}
+       },
+       "gbrain-swarm": {
+         "type": "http",
+         "url": "https://gbrain.example.com/swarm/mcp",
+         "headers": {"Authorization": "Bearer <RAW_TOKEN>"}
+       },
+       "gbrain-tasks": {
+         "type": "http",
+         "url": "https://gbrain.example.com/task/mcp",
+         "headers": {"Authorization": "Bearer <RAW_TOKEN>"}
+       }
+     }
+   }
+   ```
+
+3. Запусти `claude` в этом workspace'е. Проверь подключение: спроси «вызови `mcp__gbrain-recall__recall` с query=test, limit=1».
+4. (Путь B) Если ставишь через `agent-template/install.sh` — шаги 1–3 автоматизированы.
+
+Что доступно сразу: `mcp__gbrain-memory__create_*_note`, `mcp__gbrain-recall__{recall,get,recent,related,stats}`, `mcp__gbrain-swarm__{notify,list_my_pending,ack,...}`, `mcp__gbrain-tasks__{task_*,agent_*}`.
+
+---
+
+### Openclaw
+
+[Openclaw](https://github.com/openclaw/openclaw) — оркестратор Claude-агентов с Telegram-интерфейсом. Поддерживает MCP в той же `.mcp.json` форме что и Claude Code: оркестратор подкладывает её в headless-сессию каждого spawn'нутого агента.
+
+1. Выпусти токены — по одному на каждого Openclaw-агента (`coordinator`, `coder`, `reviewer`, ...). Identity-разделение важно: audit_log привяжет каждую запись к правильному агенту.
+2. В Openclaw workspace, в `agents/<agent-name>/.mcp.json` пропиши те же 4 сервера, что для Claude Code (`Authorization: Bearer <RAW_TOKEN_FOR_THIS_AGENT>`).
+3. Опционально: добавь recall как pre-task hook — оркестратор перед запуском агента вызывает `mcp__gbrain-recall__recall(query=<task title>, limit=5)` и кладёт результаты в system prompt. Снижает «забывание» между orchestration steps.
+4. Webhook-маршрутизация: в `swarm_mcp` ответ может вернуться в Openclaw gateway (через `webhook_url` в payload) — оркестратор сам разбудит нужного агента. Пример: `services/swarm_mcp/worker.py` уже шлёт `POST <gateway>/webhook` при `notify`.
+
+Tip: Openclaw + gbrain делятся одним vault'ом между всеми агентами оркестратора — coordinator видит decisions кодера через recall без явного passing context.
+
+---
+
+### Codex (OpenAI CLI)
+
+[Codex CLI](https://github.com/openai/codex) — командный AI-кодер от OpenAI на GPT-5.5. Поддерживает MCP через `.mcp.json` (с версии v0.110+).
+
+1. Выпусти Codex-агенту собственный Bearer (`--agent codex-reviewer` если используешь как ревьюера).
+2. В рабочей папке создай `.mcp.json` идентичной структуры (см. секцию «Claude Code» выше) — Codex CLI парсит тот же формат.
+3. Запусти: `codex --mcp-config .mcp.json`. Codex увидит 4 gbrain-сервера в своём tool catalog.
+4. Типичный use-case: **Codex как Master Reviewer** — он берёт `task_get(task_id)`, читает `recall(query=related)`, делает review, пишет findings через `create_error_pattern_note`, затем `task_review(note=...)`. Полный цикл без человека-посредника.
+
+Edge case: Codex CLI отдаёт MCP-вызовы без streaming (`streamable-http` upgrade headers могут отсутствовать). gbrain принимает оба режима — fallback на чистый JSON-RPC.
+
+---
+
+### Hermes Agent
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch) — фреймворк, который подписывает все запросы HMAC-схемой `<timestamp>.<body>`. Bearer-токены он не понимает. gbrain принимает **обе** схемы аутентификации одновременно через общий middleware. Сам Hermes не патчим.
+
+#### Как работает
 
 - В таблице `agent_tokens` у агента есть оба поля: `token_sha256` (для Bearer) и `hmac_secret_sha256` (для HMAC). Любое можно `NULL` — один из двух обязателен.
 - ASGI middleware `services/shared/asgi_auth.py` (`HermesAwareAuthMiddleware`) читает один из двух заголовков:
@@ -120,9 +230,9 @@
 - HMAC проверяется constant-time (`hmac.compare_digest`), timestamp tolerance — 5 минут (настраивается через `HMAC_TIMESTAMP_TOLERANCE_SECONDS`).
 - Identity-проверка одна и та же: scope-based RBAC через `agent_tokens.can_write_scopes` / `can_read_scopes`.
 
-### Sidecar proxy для клиентов, которые не умеют HMAC
+#### Sidecar proxy для клиентов, которые не умеют HMAC
 
-Hermes выпускает MCP tool-calls без HMAC-подписи. Чтобы не патчить Hermes, в репо есть `scripts/hermes_signed_proxy.py` (Starlette + httpx + uvicorn):
+Hermes выпускает MCP tool-calls без HMAC-подписи на каждый вызов. Чтобы не патчить Hermes, в репо есть `scripts/hermes_signed_proxy.py` (Starlette + httpx + uvicorn):
 
 ```
 Hermes → http://localhost:9100/{memory,recall,swarm,task}/mcp
@@ -135,7 +245,7 @@ Hermes → http://localhost:9100/{memory,recall,swarm,task}/mcp
 
 Запуск: `python scripts/hermes_signed_proxy.py --listen 0.0.0.0:9100 --upstream https://gbrain.example.com --secret-env GBRAIN_HMAC_SECRET --agent <agent-id>`.
 
-### Выпуск HMAC-секрета
+#### Выпуск HMAC-секрета
 
 ```bash
 python scripts/issue-hmac-secret.py --agent <agent-id>
@@ -144,6 +254,12 @@ python scripts/issue-hmac-secret.py --agent <agent-id>
 ```
 
 Полный walkthrough + примеры подписания: `docs/hermes-integration.md`.
+
+---
+
+### Любой другой MCP-клиент
+
+LangChain, AutoGen, CrewAI, llama-index, голая `httpx`-обёртка — всё подключается. Минимальное требование: HTTP POST с `Content-Type: application/json` и JSON-RPC 2.0 envelope. Список тулов: `tools/list` метод. Шаг за шагом: `docs/architecture.md` секция «Custom MCP clients».
 
 ---
 
