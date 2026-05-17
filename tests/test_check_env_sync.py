@@ -472,3 +472,160 @@ def test_m13_bash_bare_dollar_var_detected(tmp_path: Path) -> None:
     )
     assert "PG_HOST" in used_bash
     assert "UPPER" in used_bash
+
+
+# ---------------------------------------------------------------------------
+# Iter 2: bash local-variable suppression, skills/ walk, ignore markers
+# ---------------------------------------------------------------------------
+
+
+def test_iter2_bash_local_var_suppressed(tmp_path: Path) -> None:
+    """Bash local-only variables (assigned before being read) should NOT
+    appear as env-var references.
+    """
+    src = (
+        "#!/usr/bin/env bash\n"
+        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        'echo "$SCRIPT_DIR"\n'
+    )
+    repo = _make_repo(
+        tmp_path,
+        scripts_files={"thing.sh": src},
+        env_example="",
+    )
+    used = check_env_sync.find_used_vars(
+        [repo / "scripts"], include_bash=True,
+    )
+    assert "SCRIPT_DIR" not in used
+
+
+def test_iter2_bash_explicit_env_syntax_always_counts(tmp_path: Path) -> None:
+    """The ``${VAR:=default}`` form is the canonical env-default idiom and
+    counts as an env-var reference even when the var is later re-read."""
+    src = (
+        "#!/usr/bin/env bash\n"
+        ': "${INSTALL_DIR:=/opt/gbrain}"\n'
+        'echo "$INSTALL_DIR"\n'
+    )
+    repo = _make_repo(
+        tmp_path,
+        scripts_files={"thing.sh": src},
+        env_example="INSTALL_DIR=/opt/gbrain\n",
+    )
+    used = check_env_sync.find_used_vars(
+        [repo / "scripts"], include_bash=True,
+    )
+    assert "INSTALL_DIR" in used
+
+
+def test_iter2_single_quoted_heredoc_stripped(tmp_path: Path) -> None:
+    """Vars inside a single-quoted heredoc must not be scanned."""
+    src = (
+        "#!/usr/bin/env bash\n"
+        'cat > /tmp/out << \'RULE\'\n'
+        '- Quote variables: "$DOC_ONLY_VAR"\n'
+        'RULE\n'
+    )
+    repo = _make_repo(
+        tmp_path,
+        scripts_files={"doc.sh": src},
+        env_example="",
+    )
+    used = check_env_sync.find_used_vars(
+        [repo / "scripts"], include_bash=True,
+    )
+    assert "DOC_ONLY_VAR" not in used
+
+
+def test_iter2_skills_directory_walked(tmp_path: Path) -> None:
+    """skills/<name>/*.sh and *.py must be scanned by default."""
+    root = tmp_path / "repo"
+    (root / "skills" / "groq-voice").mkdir(parents=True)
+    (root / "skills" / "groq-voice" / "transcribe.sh").write_text(
+        '#!/usr/bin/env bash\nKEY="${GROQ_API_KEY:?need key}"\n',
+        encoding="utf-8",
+    )
+    (root / ".env.example").write_text("GROQ_API_KEY=\n", encoding="utf-8")
+    # Confirm `skills` is in the default roots so the main entry point picks
+    # it up without callers needing to pass it explicitly.
+    assert "skills" in check_env_sync.DEFAULT_ROOTS
+    used = check_env_sync.find_used_vars(
+        [root / r for r in check_env_sync.DEFAULT_ROOTS],
+        include_bash=True,
+    )
+    assert "GROQ_API_KEY" in used
+
+
+def test_iter2_ignore_marker_suppresses_extra_warning(tmp_path: Path) -> None:
+    """A ``# check_env_sync: ignore`` line immediately before a key removes
+    that key from the "extra" warning."""
+    env = (
+        "# check_env_sync: ignore -- transitive uvicorn log level\n"
+        "LOG_LEVEL=INFO\n"
+        "OTHER=val\n"
+    )
+    repo = _make_repo(
+        tmp_path,
+        services_files={"foo.py": "x = 1\n"},
+        env_example=env,
+    )
+    ignored = check_env_sync.parse_env_example_ignored(repo / ".env.example")
+    assert "LOG_LEVEL" in ignored
+    assert "OTHER" not in ignored
+    # End-to-end: LOG_LEVEL must NOT show up in the "extra" list, but OTHER
+    # must.
+    rc = check_env_sync.main(["--repo-root", str(repo), "--quiet"])
+    # rc 0 because warns don't fail without --strict.
+    assert rc == 0
+    rc_strict = check_env_sync.main(
+        ["--repo-root", str(repo), "--quiet", "--strict"],
+    )
+    # OTHER alone makes --strict fail; LOG_LEVEL alone would have been
+    # silenced.
+    assert rc_strict == 1
+
+
+def test_iter2_ignore_marker_blank_line_resets(tmp_path: Path) -> None:
+    """An ignore marker followed by a blank line must NOT apply to the
+    next key. Markers attach only to the immediately following KEY=.
+    """
+    env = (
+        "# check_env_sync: ignore -- meant for FOO\n"
+        "\n"
+        "BAR=value\n"
+    )
+    repo_root = tmp_path / "r"
+    repo_root.mkdir()
+    (repo_root / ".env.example").write_text(env, encoding="utf-8")
+    ignored = check_env_sync.parse_env_example_ignored(repo_root / ".env.example")
+    assert "BAR" not in ignored
+
+
+def test_h11_include_bash_clean_repo() -> None:
+    """Regression: the repo's own `.env.example` must be in sync with the
+    code base when scanned with `--include-bash`. This is the contract that
+    `.github/workflows/env-sync-check.yml` enforces in CI.
+    """
+    rc = check_env_sync.main([
+        "--repo-root", str(REPO_ROOT),
+        "--include-bash",
+        "--quiet",
+        "--no-color",
+    ])
+    assert rc == 0, (
+        "check_env_sync.py --include-bash failed on the live repo. "
+        "Inspect `.env.example` and source for new env-var drift."
+    )
+    # --strict must also pass: no "extra" warnings, no duplicates.
+    rc_strict = check_env_sync.main([
+        "--repo-root", str(REPO_ROOT),
+        "--include-bash",
+        "--strict",
+        "--quiet",
+        "--no-color",
+    ])
+    assert rc_strict == 0, (
+        "check_env_sync.py --include-bash --strict failed; .env.example "
+        "documents a var that is no longer referenced or contains a "
+        "duplicate key."
+    )

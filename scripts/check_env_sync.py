@@ -22,6 +22,33 @@ Recognized Bash patterns (with ``--include-bash``):
   * ``${VAR}`` / ``${VAR:-default}`` / ``${VAR?err}`` / ``${VAR:?err}``
   * ``$VAR`` (bare, no braces — M13)
 
+Bash local-variable suppression (Iter 2):
+  Bash scripts assign many local-only variables (e.g. ``SCRIPT_DIR=...``) and
+  then reference them via ``$SCRIPT_DIR``. Naive scanning treats these as
+  env-var reads and floods the "missing" list with false positives. To filter
+  them out, the bash scanner tracks per-file local assignments and only
+  counts a variable as an env-var reference if one of the following holds:
+
+    * It appears with an explicit env-var syntax — ``${VAR:-...}``,
+      ``${VAR:?...}``, ``${VAR:=...}``, ``${VAR?...}`` — even once. Those
+      forms are unambiguous env reads (they declare a default or required
+      env value), so they always count.
+    * OR it appears as plain ``$VAR`` / ``${VAR}`` AND the same file never
+      assigns it locally (``VAR=``, ``local VAR=``, ``export VAR=``,
+      ``declare VAR=``, ``readonly VAR=``, ``typeset VAR=``,
+      ``for VAR in``, ``read [-r] VAR``, etc.).
+
+Ignore markers in ``.env.example`` (Iter 2):
+  Some documented variables live only in non-code locations (markdown docs,
+  Caddyfile templates, transitive deps like uvicorn's ``LOG_LEVEL``). Mark
+  these with a comment on the preceding line:
+
+      # check_env_sync: ignore -- transitive dep (uvicorn)
+      LOG_LEVEL=INFO
+
+  The scanner records the marker and excludes the next KEY= line from the
+  "extra" warning. Reason text after ``--`` is informational only.
+
 Stdlib only (plus ``tokenize`` for accurate Python string stripping).
 Designed to run in CI without extra deps.
 """
@@ -66,8 +93,36 @@ _SH_PATTERN = re.compile(rf"""\$\{{{_VAR}(?:[:#%/^,!*@-][^}}]*)?\}}""")
 # don't match the second `$` in `$$` (PID).
 _SH_BARE_PATTERN = re.compile(rf"""(?<!\$)\${_VAR}\b""")
 
+# Iter 2: explicit env-var syntax (always counts, even if locally assigned).
+# Matches ${VAR:-default}, ${VAR:?err}, ${VAR:=default}, ${VAR?err}.
+_SH_EXPLICIT_ENV_PATTERN = re.compile(
+    rf"""\$\{{{_VAR}(?::[-?=]|\?)[^}}]*\}}"""
+)
+
+# Iter 2: local-assignment detection in bash. Each pattern captures the
+# variable name being assigned.
+_SH_ASSIGN_PATTERNS = [
+    # VAR=value (at start of line, optionally after a keyword prefix).
+    re.compile(
+        rf"""^\s*(?:local|export|declare|readonly|typeset)?\s*{_VAR}\s*="""
+    ),
+    # `for VAR in ...` and `for VAR; do`.
+    re.compile(rf"""^\s*for\s+{_VAR}\s+(?:in\b|;)"""),
+    # `read VAR [VAR2 ...]` — captures every var token after `read`.
+    re.compile(rf"""(?:^|;|\|\|?|&&|\s)read\b(?:\s+-[a-zA-Z]+)*\s+([A-Z_][A-Z0-9_\s]*)"""),
+    # `: "${VAR:=default}"` already covered by explicit-env pattern, but the
+    # := form ALSO counts as a local assignment so we capture it here too
+    # to avoid double-counting in the local-var filter logic.
+]
+
 # .env.example: KEY=value (KEY may have value or be empty).
 _ENV_KEY = re.compile(rf"""^{_VAR}\s*=""")
+
+# Iter 2: ignore marker in .env.example. The marker on a line preceding a
+# KEY=value line removes the next key from the "extra" warning.
+_IGNORE_MARKER = re.compile(
+    r"""^\s*#\s*check_env_sync:\s*ignore\b"""
+)
 
 # Reserved system vars that should never be flagged.
 RESERVED_VARS: frozenset[str] = frozenset({
@@ -81,10 +136,19 @@ RESERVED_VARS: frozenset[str] = frozenset({
     "PYTHONPATH", "VIRTUAL_ENV", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
     # ssh / shell positionals indirectly
     "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+    # Iter 2: bash built-ins and /etc/os-release fields commonly sourced
+    # from install scripts. None of these are user-configurable env vars.
+    "OSTYPE", "IFS", "RANDOM", "SECONDS", "PPID", "UID", "EUID", "GROUPS",
+    "FUNCNAME", "LINENO", "BASH_SOURCE", "BASH_VERSION", "BASH_REMATCH",
+    "BASHPID", "PIPESTATUS",
+    # /etc/os-release fields (sourced via `. /etc/os-release` in installers)
+    "ID", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME", "NAME",
 })
 
 # Default scan roots, relative to repo root.
-DEFAULT_ROOTS = ["services", "inbox-agent", "agent-template", "scripts"]
+# Iter 2: `skills/` added so env vars referenced from skill helper scripts
+# (e.g. ``GROQ_API_KEY`` in ``skills/groq-voice/transcribe.sh``) are seen.
+DEFAULT_ROOTS = ["services", "inbox-agent", "agent-template", "scripts", "skills"]
 
 # Files to never scan (avoid self-reference / regex contamination).
 SELF_FILENAMES = frozenset({"check_env_sync.py"})
@@ -297,24 +361,146 @@ def _scan_python_file(path: Path) -> list[tuple[str, int]]:
     return refs
 
 
+def _strip_single_quoted_heredocs(text: str) -> str:
+    """Replace single-quoted heredoc bodies with blank lines.
+
+    Iter 2: ``cat << 'TAG' ... TAG`` and ``cat << "TAG" ... TAG`` bodies are
+    literal — bash does NOT expand ``$VAR`` inside them. Treating those
+    lines as live shell text yields false positives (e.g. ``"$VAR"`` in a
+    documentation heredoc shows up as a missing env var). Bodies of
+    unquoted heredocs (``cat << TAG``) ARE expanded, so those are left
+    intact.
+    """
+    out_lines: list[str] = []
+    in_heredoc = False
+    tag = ""
+    heredoc_open = re.compile(
+        r"""<<-?\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]"""
+    )
+    for raw in text.splitlines():
+        if in_heredoc:
+            # Heredoc end tag may be indented for ``<<-``. Match
+            # whitespace-trimmed line equality.
+            if raw.strip() == tag:
+                in_heredoc = False
+                out_lines.append(raw)
+            else:
+                out_lines.append("")
+            continue
+        m = heredoc_open.search(raw)
+        if m:
+            tag = m.group(1)
+            in_heredoc = True
+            out_lines.append(raw)
+        else:
+            out_lines.append(raw)
+    return "\n".join(out_lines)
+
+
+def _bash_assignments_with_lines(text: str) -> dict[str, int]:
+    """Return ``{VAR: first_line_no}`` for variables assigned locally.
+
+    Iter 2: tracks the first line at which a var is assigned. Used to
+    decide whether a later reference is env (read before any local set) or
+    local (read after a local set).
+
+    Captures:
+
+      * ``VAR=value`` at the start of a line (optionally prefixed by
+        ``local``/``export``/``declare``/``readonly``/``typeset``)
+      * ``for VAR in ...`` / ``for VAR; do``
+      * ``read [-r] VAR [VAR2 ...]``
+    """
+    first_assign: dict[str, int] = {}
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for pat in _SH_ASSIGN_PATTERNS:
+            for m in pat.finditer(raw):
+                captured = m.group(1)
+                for token in captured.split():
+                    if re.fullmatch(_VAR, token) and token not in first_assign:
+                        first_assign[token] = line_no
+    return first_assign
+
+
 def _scan_bash_file(path: Path) -> list[tuple[str, int]]:
     """Return list of (var_name, line_no) found in a bash file. Skips comment lines.
 
     M13: also matches bare ``$VAR`` (no braces).
+
+    Iter 2: filters out vars that are read AFTER a local assignment in the
+    same file. The rule is "first-touch wins":
+
+      * If the variable is FIRST seen via a read (``$VAR``, ``${VAR}``,
+        ``${VAR:-...}``, ``${VAR:?...}``, ``${VAR:=...}``, ``${VAR?...}``),
+        it is an env-var reference and ALL its reads in the file are kept.
+      * If the variable is FIRST seen via a local assignment
+        (``VAR=value``, ``for VAR in``, ``read VAR``, etc.) and never
+        appears with explicit env-syntax (``:-`` / ``:?`` / ``:=`` / ``?``)
+        anywhere in the file, all subsequent reads are dropped.
+      * The explicit env-syntax escape hatch (``${VAR:=default}``) still
+        counts the var as env-readable even if a later line re-assigns it,
+        because the ``:=`` form IS the canonical "default this env var"
+        idiom in install scripts.
+
+    Single-quoted heredoc bodies (``<< 'TAG'``) are stripped before scan
+    because bash does not expand ``$VAR`` inside them.
     """
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+
+    text = _strip_single_quoted_heredocs(raw_text)
+    first_assign = _bash_assignments_with_lines(text)
+
+    # Walk to find explicit env-syntax (the ":-"/":?"/":="/"?" forms),
+    # tracking the first line each var appears with such syntax.
+    explicit_env_first: dict[str, int] = {}
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for m in _SH_EXPLICIT_ENV_PATTERN.finditer(raw):
+            name = m.group(1)
+            if name not in explicit_env_first:
+                explicit_env_first[name] = line_no
+
+    # Build the per-var classification.
+    is_env: dict[str, bool] = {}
+    for name in set(first_assign) | set(explicit_env_first):
+        assign_line = first_assign.get(name)
+        env_line = explicit_env_first.get(name)
+        if env_line is not None and (assign_line is None or env_line <= assign_line):
+            is_env[name] = True
+        elif assign_line is not None and env_line is None:
+            is_env[name] = False
+        elif env_line is not None:
+            # Both present, but explicit env-syntax is later. Still count as
+            # env: the `:-`/`:=` form is the canonical default-this-env-var
+            # idiom, even if the var was first set locally above. (Rare in
+            # practice.)
+            is_env[name] = True
+        else:
+            is_env[name] = True
+
     refs: list[tuple[str, int]] = []
     for line_no, raw in enumerate(text.splitlines(), start=1):
         stripped = raw.lstrip()
         if stripped.startswith("#"):
             continue
         for m in _SH_PATTERN.finditer(raw):
-            refs.append((m.group(1), line_no))
+            name = m.group(1)
+            if name in is_env and is_env[name] is False:
+                continue
+            refs.append((name, line_no))
         for m in _SH_BARE_PATTERN.finditer(raw):
-            refs.append((m.group(1), line_no))
+            name = m.group(1)
+            if name in is_env and is_env[name] is False:
+                continue
+            refs.append((name, line_no))
     return refs
 
 
@@ -376,14 +562,51 @@ def parse_env_example_with_lines(path: Path) -> dict[str, list[int]]:
     return keys
 
 
+def parse_env_example_ignored(path: Path) -> set[str]:
+    """Iter 2: return the set of KEYs that carry a ``check_env_sync: ignore``
+    marker on the immediately preceding comment line(s).
+
+    Multiple consecutive comment lines are allowed before the key. The
+    marker is recognized anywhere within the block of comments leading up
+    to the key. Reason text after ``--`` is informational only.
+    """
+    if not path.exists():
+        return set()
+    ignored: set[str] = set()
+    marker_armed = False
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.lstrip()
+        if not line:
+            # Blank line resets any pending marker — markers must immediately
+            # precede the key they apply to.
+            marker_armed = False
+            continue
+        if line.startswith("#"):
+            if _IGNORE_MARKER.match(line):
+                marker_armed = True
+            continue
+        m = _ENV_KEY.match(line)
+        if m:
+            if marker_armed:
+                ignored.add(m.group(1))
+            marker_armed = False
+    return ignored
+
+
 def diff_vars(
     used: dict[str, list[tuple[Path, int, str]]],
     documented: set[str],
+    ignored: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Return (missing_from_docs, extra_in_docs)."""
+    """Return (missing_from_docs, extra_in_docs).
+
+    Iter 2: ``ignored`` is the set of documented KEYs marked with
+    ``check_env_sync: ignore``. They are excluded from the "extra" warning.
+    """
     used_names = set(used.keys())
+    ignored = ignored or set()
     missing = sorted(used_names - documented - RESERVED_VARS)
-    extra = sorted(documented - used_names - RESERVED_VARS)
+    extra = sorted(documented - used_names - RESERVED_VARS - ignored)
     return missing, extra
 
 
@@ -517,7 +740,8 @@ def main(argv: list[str] | None = None) -> int:
     used = find_used_vars(roots, include_bash=args.include_bash)
     documented_with_lines = parse_env_example_with_lines(env_example)
     documented = set(documented_with_lines.keys())
-    missing, extra = diff_vars(used, documented)
+    ignored = parse_env_example_ignored(env_example)
+    missing, extra = diff_vars(used, documented, ignored=ignored)
 
     # M3: duplicate key detection. {KEY: [line, line, ...]} -> duplicates
     # appear when len > 1.
