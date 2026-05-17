@@ -11,6 +11,8 @@ import asyncpg
 import numpy as np
 from fastmcp import Context
 
+from services.shared.tool_gating import should_register_tool
+
 from .cache import CacheKey, RecallCache
 from .cross_link import expand_links, find_wikilinks
 from .source_weights import SOURCE_WEIGHTS, temporal_decay
@@ -146,52 +148,123 @@ async def _fts_search(
     extra_params: list[Any],
     limit: int = 50,
 ) -> list[asyncpg.Record]:
-    """Run full-text search using tsvector.
+    """Run full-text search using tsvector with websearch syntax and cover-density ranking.
+
+    A blank ``query_text`` short-circuits to an empty list without touching the DB.
 
     Args:
         pool: Asyncpg connection pool.
-        query_text: Raw search query string.
+        query_text: Raw search query string. Supports phrases, OR, and ``-`` negation
+            via ``websearch_to_tsquery``.
         extra_where: Additional WHERE clause fragments.
         extra_params: Parameters for extra_where.
         limit: Max rows to return.
 
     Returns:
-        List of asyncpg Records.
+        List of asyncpg Records ordered by ``fts_score DESC, c.id ASC``.
     """
+    if not query_text or not query_text.strip():
+        return []
+
     params: list[Any] = [query_text]
     params.extend(extra_params)
 
     query = f"""
+        WITH q AS (
+            SELECT websearch_to_tsquery('russian', $1) AS tsq
+        )
         SELECT c.id, c.doc_id, c.content, d.path, d.source_type,
                d.scope, d.updated_at,
-               ts_rank(c.content_tsv, plainto_tsquery('russian', $1)) AS fts_score
+               ts_rank_cd(c.content_tsv, q.tsq) AS fts_score
         FROM chunks c
         JOIN documents d ON c.doc_id = d.id
-        WHERE c.content_tsv @@ plainto_tsquery('russian', $1)
+        CROSS JOIN q
+        WHERE c.content_tsv @@ q.tsq
           AND d.source_type != 'daily'{extra_where}
+        ORDER BY fts_score DESC, c.id ASC
         LIMIT {limit}
     """
     return await pool.fetch(query, *params)
 
 
+def _effective_rrf_weights(
+    has_vec: bool,
+    has_fts: bool,
+    vec_weight: float,
+    fts_weight: float,
+) -> tuple[float, float]:
+    """Compute effective per-stream RRF weights after handling missing streams.
+
+    Behavior:
+
+    - Missing streams get weight 0.
+    - Remaining streams are re-normalized to sum to 1.0.
+    - If both streams are missing, returns (0.0, 0.0).
+    - If both configured weights are zero but rows exist, falls back to equal
+      weights for present streams.
+
+    Args:
+        has_vec: True if vector stream returned at least one row.
+        has_fts: True if FTS stream returned at least one row.
+        vec_weight: Configured vector stream weight.
+        fts_weight: Configured FTS stream weight.
+
+    Returns:
+        (effective_vec_weight, effective_fts_weight).
+    """
+    eff_vec = vec_weight if has_vec else 0.0
+    eff_fts = fts_weight if has_fts else 0.0
+
+    total = eff_vec + eff_fts
+    if total > 0:
+        return (eff_vec / total, eff_fts / total)
+
+    # No effective weight remains: either both streams missing, or both
+    # configured weights are zero but at least one stream has rows.
+    if not has_vec and not has_fts:
+        return (0.0, 0.0)
+
+    # Both zero configured but rows exist on at least one side -> equal fallback.
+    present = (1.0 if has_vec else 0.0) + (1.0 if has_fts else 0.0)
+    return (
+        (1.0 / present) if has_vec else 0.0,
+        (1.0 / present) if has_fts else 0.0,
+    )
+
+
 def _rrf_fuse(
     vec_rows: list[asyncpg.Record],
     fts_rows: list[asyncpg.Record],
+    vec_weight: float = 0.6,
+    fts_weight: float = 0.4,
 ) -> dict[int, dict[str, Any]]:
-    """Fuse vector and FTS results using Reciprocal Rank Fusion.
+    """Fuse vector and FTS results using weighted Reciprocal Rank Fusion.
+
+    Uses 1-based ranks (matching the reference TS implementation in agentmemory)
+    and stores per-stream debug scores on merged rows when available.
 
     Args:
         vec_rows: Results from vector search (ranked by similarity).
-        fts_rows: Results from full-text search (ranked by ts_rank).
+        fts_rows: Results from full-text search (ranked by ts_rank_cd).
+        vec_weight: Configured vector stream weight.
+        fts_weight: Configured FTS stream weight.
 
     Returns:
-        Dict mapping chunk_id to merged record with rrf score.
+        Dict mapping chunk_id to merged record with ``rrf`` score and
+        optional ``vec_score``/``fts_score`` debug fields.
     """
+    has_vec = len(vec_rows) > 0
+    has_fts = len(fts_rows) > 0
+    eff_vec, eff_fts = _effective_rrf_weights(
+        has_vec, has_fts, vec_weight, fts_weight
+    )
+
     merged: dict[int, dict[str, Any]] = {}
 
-    for rank, row in enumerate(vec_rows):
+    for rank, row in enumerate(vec_rows, start=1):
         cid = row["id"]
-        merged[cid] = {
+        contribution = eff_vec / (_RRF_K + rank)
+        entry = {
             "id": cid,
             "doc_id": row["doc_id"],
             "content": row["content"],
@@ -199,15 +272,26 @@ def _rrf_fuse(
             "source_type": row["source_type"],
             "scope": row["scope"],
             "updated_at": row["updated_at"],
-            "rrf": 1.0 / (_RRF_K + rank),
+            "rrf": contribution,
         }
+        # vec_score may be present on the row as 1 - cosine_distance
+        try:
+            entry["vec_score"] = row["vec_score"]
+        except (KeyError, IndexError):
+            pass
+        merged[cid] = entry
 
-    for rank, row in enumerate(fts_rows):
+    for rank, row in enumerate(fts_rows, start=1):
         cid = row["id"]
+        contribution = eff_fts / (_RRF_K + rank)
         if cid in merged:
-            merged[cid]["rrf"] += 1.0 / (_RRF_K + rank)
+            merged[cid]["rrf"] += contribution
+            try:
+                merged[cid]["fts_score"] = row["fts_score"]
+            except (KeyError, IndexError):
+                pass
         else:
-            merged[cid] = {
+            entry = {
                 "id": cid,
                 "doc_id": row["doc_id"],
                 "content": row["content"],
@@ -215,10 +299,65 @@ def _rrf_fuse(
                 "source_type": row["source_type"],
                 "scope": row["scope"],
                 "updated_at": row["updated_at"],
-                "rrf": 1.0 / (_RRF_K + rank),
+                "rrf": contribution,
             }
+            try:
+                entry["fts_score"] = row["fts_score"]
+            except (KeyError, IndexError):
+                pass
+            merged[cid] = entry
 
     return merged
+
+
+def _diversify_by_scope(
+    scored: list[dict[str, Any]],
+    limit: int,
+    max_per_scope: int,
+) -> list[dict[str, Any]]:
+    """Diversify top-K results by capping the number per scope, then filling back.
+
+    Two-pass selection over ``scored`` (already sorted by descending score):
+
+    1. First pass: walk in score order, take items whose scope count is below
+       ``max_per_scope``, skip items that would exceed the cap.
+    2. Second pass: fill remaining slots up to ``limit`` from the skipped items
+       in their original order, preserving ranking.
+
+    Args:
+        scored: Results sorted by descending score.
+        limit: Maximum number of items to return.
+        max_per_scope: Max items per scope in the first pass. If ``<= 0``, the
+            function returns ``scored[:limit]`` unchanged.
+
+    Returns:
+        A new list of at most ``limit`` items with no duplicates.
+    """
+    if max_per_scope <= 0:
+        return scored[:limit]
+
+    selected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    counts: dict[Any, int] = {}
+
+    for item in scored:
+        if len(selected) >= limit:
+            # Stop early once we've already reached the cap.
+            break
+        scope = item.get("scope")
+        if counts.get(scope, 0) < max_per_scope:
+            selected.append(item)
+            counts[scope] = counts.get(scope, 0) + 1
+        else:
+            skipped.append(item)
+
+    if len(selected) < limit:
+        for item in skipped:
+            if len(selected) >= limit:
+                break
+            selected.append(item)
+
+    return selected
 
 
 def register_tools(
@@ -227,6 +366,11 @@ def register_tools(
     get_embed_fn: Any,
     get_cache_fn: Any,
     get_vault_root_fn: Any,
+    *,
+    tool_set: str = "core",
+    rrf_weight_bm25: float = 0.4,
+    rrf_weight_vec: float = 0.6,
+    diversify_max: int = 0,
 ) -> None:
     """Register all gbrain MCP tools on the server.
 
@@ -236,9 +380,23 @@ def register_tools(
         get_embed_fn: Callable returning TextEmbedding model.
         get_cache_fn: Callable returning RecallCache.
         get_vault_root_fn: Callable returning vault root Path.
+        tool_set: ``"core"`` or ``"all"`` -- gates which tools register.
+        rrf_weight_bm25: Weight for the FTS (BM25-ish) stream in RRF.
+        rrf_weight_vec: Weight for the vector stream in RRF.
+        diversify_max: If > 0, cap the number of results per scope in the
+            first diversification pass before fill-back.
     """
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    # In skip-mode the function still lives in the closure but is NOT recorded on `mcp` — clients cannot invoke it.
+    def gated_tool(tool_name: str, **kwargs: Any) -> Any:
+        """Decorator: register on ``mcp`` only if gating policy allows the tool."""
+        def wrapper(fn: Any) -> Any:
+            if should_register_tool("recall_mcp", tool_name, tool_set):
+                return mcp.tool(**kwargs)(fn)
+            return fn
+        return wrapper
+
+    @gated_tool("recall", annotations={"readOnlyHint": True})
     async def recall(
         query: str,
         limit: int = 5,
@@ -262,7 +420,16 @@ def register_tools(
             scopes = ["*"]
 
         cache = get_cache_fn()
-        cache_key: CacheKey = (query, limit, tuple(sorted(scopes)))
+        source_key: tuple[str, ...] | None = (
+            tuple(sorted(source_types)) if source_types is not None else None
+        )
+        cache_key: CacheKey = (
+            query,
+            limit,
+            tuple(sorted(scopes)),
+            agent_filter,
+            source_key,
+        )
         cached = cache.get(cache_key)
         if cached is not None:
             logger.debug("recall cache hit: query=%s", query[:50])
@@ -272,7 +439,8 @@ def register_tools(
         embed_model = get_embed_fn()
 
         # Embed query
-        embeddings = list(embed_model.embed([query]))
+        # FastEmbed.embed is sync/CPU-bound; offload to thread to avoid blocking event loop.
+        embeddings = await asyncio.to_thread(lambda: list(embed_model.embed([query])))
         vec = embeddings[0].tolist()
 
         # Build filters (param offset 2 because $1 is vec/query)
@@ -286,8 +454,13 @@ def register_tools(
             _fts_search(pool, query, extra_where, extra_params),
         )
 
-        # RRF fusion
-        merged = _rrf_fuse(vec_rows, fts_rows)
+        # Weighted RRF fusion
+        merged = _rrf_fuse(
+            vec_rows,
+            fts_rows,
+            vec_weight=rrf_weight_vec,
+            fts_weight=rrf_weight_bm25,
+        )
 
         # Apply source weight + temporal decay
         now = datetime.now(timezone.utc)
@@ -314,7 +487,7 @@ def register_tools(
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        results = scored[:limit]
+        results = _diversify_by_scope(scored, limit, diversify_max)
 
         # Cross-link expansion (1-hop)
         existing_ids: set[int] = {r["_doc_id"] for r in results}
@@ -342,7 +515,7 @@ def register_tools(
         )
         return results
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    @gated_tool("recent", annotations={"readOnlyHint": True})
     async def recent(
         scope: str,
         limit: int = 10,
@@ -381,7 +554,7 @@ def register_tools(
             for r in rows
         ]
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    @gated_tool("related", annotations={"readOnlyHint": True})
     async def related(
         path: str,
         limit: int = 5,
@@ -468,7 +641,7 @@ def register_tools(
         )
         return results[:limit]
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    @gated_tool("get", annotations={"readOnlyHint": True})
     async def get(path: str) -> dict[str, Any] | None:
         """Return full document content by path.
 
@@ -502,7 +675,7 @@ def register_tools(
             "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
         }
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    @gated_tool("stats", annotations={"readOnlyHint": True})
     async def stats() -> dict[str, Any]:
         """Return aggregate counters for the brain database.
 
@@ -530,7 +703,7 @@ def register_tools(
             "total_chunks": chunks_row["cnt"] if chunks_row else 0,
         }
 
-    @mcp.tool(annotations={"readOnlyHint": True})
+    @gated_tool("reindex_check", annotations={"readOnlyHint": True})
     async def reindex_check() -> list[dict[str, str]]:
         """Find stale documents where DB sha256 doesn't match file on disk.
 

@@ -11,6 +11,9 @@ and skipped unless GBRAIN_TEST_INTEGRATION=1.
 """
 from __future__ import annotations
 
+import asyncio
+import importlib
+
 import pytest
 
 from services.swarm_mcp.outbox import (
@@ -21,6 +24,46 @@ from services.swarm_mcp.outbox import (
 )
 from services.swarm_mcp.server import _REQUEST_AUTH
 from services.swarm_mcp.worker import _format_virtual_prompt, _load_gateways
+
+
+# --- Tool-gating helpers -----------------------------------------------------
+
+# Swarm tools that must be registered regardless of GBRAIN_TOOLS value.
+_ALWAYS_ON_SWARM_TOOLS = {"notify", "ack"}
+
+# Swarm tools that are only registered in `all` mode.
+_ALL_ONLY_SWARM_TOOLS = {
+    "broadcast",
+    "escalate",
+    "stats",
+    "get_delivery",
+    "list_recent_deliveries",
+    "list_my_pending",
+}
+
+_ALL_SWARM_TOOLS = _ALWAYS_ON_SWARM_TOOLS | _ALL_ONLY_SWARM_TOOLS
+
+
+def _registered_tool_names(mcp_instance) -> set[str]:
+    """Return the set of FastMCP tool names registered on an mcp instance.
+
+    Uses the smallest stable accessor available on FastMCP 2.x.
+    """
+    tools = asyncio.run(mcp_instance._list_tools())
+    return {t.name for t in tools}
+
+
+def _reload_swarm_server_with_tool_set(
+    monkeypatch: pytest.MonkeyPatch, tool_set: str
+):
+    """Reload services.swarm_mcp.server with GBRAIN_TOOLS=<tool_set>.
+
+    Returns the freshly reloaded module so callers can inspect its `mcp`.
+    """
+    monkeypatch.setenv("GBRAIN_TOOLS", tool_set)
+    import services.swarm_mcp.server as server_mod
+
+    return importlib.reload(server_mod)
 
 
 def test_request_auth_context_var_exists() -> None:
@@ -153,3 +196,48 @@ def test_swarm_mcp_missing_auth_returns_401() -> None:
 def test_swarm_mcp_bad_auth_returns_401() -> None:
     """End-to-end: unknown Bearer token → server rejects."""
     pytest.skip("swarm-mcp integration smoke not yet implemented")
+
+
+# --- Tool-gating tests -------------------------------------------------------
+
+
+def test_swarm_register_decorators_skipped_in_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In core mode, non-always-on swarm tools must NOT be registered."""
+    server_mod = _reload_swarm_server_with_tool_set(monkeypatch, "core")
+    names = _registered_tool_names(server_mod.mcp)
+
+    # Always-on tools are present.
+    assert _ALWAYS_ON_SWARM_TOOLS.issubset(names), (
+        f"notify/ack must be in core mode, got {names}"
+    )
+    # All-only tools are absent.
+    leaked = names & _ALL_ONLY_SWARM_TOOLS
+    assert not leaked, f"core mode leaked all-only tools: {leaked}"
+
+
+def test_swarm_register_decorators_present_in_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In all mode, every swarm tool must be registered."""
+    server_mod = _reload_swarm_server_with_tool_set(monkeypatch, "all")
+    names = _registered_tool_names(server_mod.mcp)
+
+    missing = _ALL_SWARM_TOOLS - names
+    assert not missing, f"all mode missing swarm tools: {missing}"
+
+
+def test_swarm_notify_ack_always_on_both_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """notify and ack are registered in both core and all modes."""
+    for tool_set in ("core", "all"):
+        server_mod = _reload_swarm_server_with_tool_set(monkeypatch, tool_set)
+        names = _registered_tool_names(server_mod.mcp)
+        assert "notify" in names, (
+            f"notify missing in tool_set={tool_set}; registered={names}"
+        )
+        assert "ack" in names, (
+            f"ack missing in tool_set={tool_set}; registered={names}"
+        )

@@ -1,17 +1,21 @@
-"""MCP tools for memory-mcp write service (9 tools)."""
+"""MCP tools for memory-mcp write service (9 doc tools + 6 slot tools, gated by GBRAIN_TOOLS)."""
 import hashlib
 import logging
+import math
 import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import yaml
+from asyncpg import UniqueViolationError
 
 from services.shared.auth import AgentContext, authenticate, check_write_scope
 from services.shared.audit import log_audit
+from services.shared.tool_gating import should_register_tool
 
 from .path_guard import validate_path
 
@@ -26,6 +30,129 @@ _REQUEST_AUTH: ContextVar[str | None] = ContextVar("memory_request_auth", defaul
 # ---------------------------------------------------------------------------
 
 MAX_SLUG_LENGTH = 60
+
+# ---------------------------------------------------------------------------
+# Slot constants
+# ---------------------------------------------------------------------------
+
+SLOTS_SCOPE = "slots"
+SLOT_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+DEFAULT_SLOT_SIZE_LIMIT = 2000
+DEFAULT_SLOT_HARD_CAP = 20000
+SLOT_WARNING_RATIO = 0.8
+
+
+def _validate_slot_label(label: str) -> str:
+    """Validate slot label, return normalized form.
+
+    Raises ValueError if label does not match ^[a-z][a-z0-9_]{0,63}$.
+    """
+    if not isinstance(label, str):
+        raise ValueError(
+            "slot label must be a string matching ^[a-z][a-z0-9_]{0,63}$"
+        )
+    normalized = label.strip()
+    if not SLOT_LABEL_RE.match(normalized):
+        raise ValueError(
+            "slot label must match ^[a-z][a-z0-9_]{0,63}$ "
+            "(lowercase letter start, then lowercase letters/digits/underscores, max 64 chars)"
+        )
+    return normalized
+
+
+def _validate_slot_limits(size_limit: int, hard_cap: int) -> tuple[int, int]:
+    """Validate slot size_limit and hard_cap, return them.
+
+    Enforces 1 <= size_limit <= hard_cap <= 20000.
+    """
+    if not isinstance(size_limit, int) or isinstance(size_limit, bool):
+        raise ValueError("size_limit must be an integer")
+    if not isinstance(hard_cap, int) or isinstance(hard_cap, bool):
+        raise ValueError("hard_cap must be an integer")
+    if size_limit < 1:
+        raise ValueError("size_limit must be >= 1")
+    if hard_cap < 1:
+        raise ValueError("hard_cap must be >= 1")
+    if hard_cap > DEFAULT_SLOT_HARD_CAP:
+        raise ValueError(
+            f"hard_cap must be <= {DEFAULT_SLOT_HARD_CAP}"
+        )
+    if size_limit > hard_cap:
+        raise ValueError("size_limit must be <= hard_cap")
+    return size_limit, hard_cap
+
+
+def _slot_warning(size: int, size_limit: int) -> str | None:
+    """Return a soft warning string when size (bytes) is >= 80% of size_limit (bytes)."""
+    if size_limit <= 0:
+        return None
+    threshold = math.ceil(size_limit * SLOT_WARNING_RATIO)
+    if size >= threshold:
+        return (
+            f"slot is at {size}/{size_limit} bytes "
+            f"(>= {int(SLOT_WARNING_RATIO * 100)}% of size_limit)"
+        )
+    return None
+
+
+def _assert_slot_size(content: str, size_limit: int, hard_cap: int) -> None:
+    """Raise PermissionError('413 ...') if content (in UTF-8 bytes) exceeds limits."""
+    length = len(content.encode("utf-8"))
+    if length > hard_cap:
+        raise PermissionError(
+            f"413 slot overflow: {length} bytes exceeds hard_cap {hard_cap}"
+        )
+    if length > size_limit:
+        raise PermissionError(
+            f"413 slot overflow: {length} bytes exceeds size_limit {size_limit}"
+        )
+
+
+def _slot_payload(row: "asyncpg.Record | dict[str, Any]", include_content: bool = True) -> dict[str, Any]:
+    """Serialize a slot row to a JSON-friendly dict.
+
+    Always includes size and warning. Includes content only when requested.
+    """
+    try:
+        content = row["content"]
+    except (KeyError, IndexError):
+        content = ""
+    if content is None:
+        content = ""
+    size_limit = int(row["size_limit"])
+    size = len(content.encode("utf-8"))
+    payload: dict[str, Any] = {
+        "id": int(row["id"]),
+        "label": str(row["label"]),
+        "size": size,
+        "size_limit": size_limit,
+        "hard_cap": int(row["hard_cap"]),
+        "pinned": bool(row["pinned"]),
+        "agent": str(row["agent"]),
+        "created_at": row["created_at"].isoformat() if row["created_at"] is not None else None,
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] is not None else None,
+        "warning": _slot_warning(size, size_limit),
+    }
+    if include_content:
+        payload["content"] = content
+    return payload
+
+
+async def _authenticate_for_slots(
+    ctx: dict[str, object] | None,
+    pool: asyncpg.Pool,
+) -> AgentContext:
+    """Extract bearer token and authenticate. No silent fallback."""
+    token = await _extract_token(ctx or {})
+    return await authenticate(token, pool)
+
+
+def _require_slots_write(agent_ctx: AgentContext) -> None:
+    """Raise PermissionError if agent cannot write to 'slots' scope."""
+    if not check_write_scope(agent_ctx, SLOTS_SCOPE):
+        raise PermissionError(
+            f"Agent '{agent_ctx.agent}' cannot write to {SLOTS_SCOPE}"
+        )
 
 
 def _slugify(title: str) -> str:
@@ -187,22 +314,36 @@ def register_tools(
     mcp: object,
     vault_root: str,
     get_pool_fn: object,
+    *,
+    tool_set: str = "core",
 ) -> None:
-    """Register all 9 MCP tools on the FastMCP server.
+    """Register memory MCP tools on the FastMCP server.
 
     Args:
         mcp: FastMCP server instance.
         vault_root: Absolute path to vault root.
         get_pool_fn: Async callable returning asyncpg.Pool.
+        tool_set: Tool gating mode ("core" or "all"). Determines which tools
+            are registered. See services.shared.tool_gating.
     """
     from fastmcp import FastMCP
 
     server: FastMCP = mcp  # type: ignore[assignment]
 
+    # In skip-mode the function still lives in the closure but is NOT recorded on `mcp` — clients cannot invoke it.
+    def gated_tool(tool_name: str, **kwargs):
+        """Decorator that registers a tool only if gating allows it."""
+        def decorator(fn):
+            if should_register_tool("memory_mcp", tool_name, tool_set):
+                return server.tool(**kwargs)(fn)
+            return fn
+        return decorator
+
     # ------------------------------------------------------------------
     # 1. create_decision_note
     # ------------------------------------------------------------------
-    @server.tool(
+    @gated_tool(
+        "create_decision_note",
         annotations={"readOnlyHint": False},
     )
     async def create_decision_note(
@@ -270,7 +411,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 2. create_runbook_note
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("create_runbook_note", annotations={"readOnlyHint": False})
     async def create_runbook_note(
         title: str,
         body: str,
@@ -329,7 +470,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 3. create_error_pattern_note
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("create_error_pattern_note", annotations={"readOnlyHint": False})
     async def create_error_pattern_note(
         title: str,
         category: str,
@@ -397,7 +538,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 4. create_external_note
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("create_external_note", annotations={"readOnlyHint": False})
     async def create_external_note(
         source: str,
         url: str,
@@ -461,7 +602,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 5. create_handoff
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("create_handoff", annotations={"readOnlyHint": False})
     async def create_handoff(
         from_agent: str,
         to_agent: str,
@@ -520,7 +661,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 6. append_daily_log
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("append_daily_log", annotations={"readOnlyHint": False})
     async def append_daily_log(
         agent: str,
         body: str,
@@ -581,7 +722,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 7. update_index
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("update_index", annotations={"readOnlyHint": False})
     async def update_index(
         folder: str,
         ctx: dict[str, object] | None = None,
@@ -631,7 +772,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 8. update_document
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("update_document", annotations={"readOnlyHint": False})
     async def update_document(
         path: str,
         body: str,
@@ -696,7 +837,7 @@ def register_tools(
     # ------------------------------------------------------------------
     # 9. supersede_decision
     # ------------------------------------------------------------------
-    @server.tool(annotations={"readOnlyHint": False})
+    @gated_tool("supersede_decision", annotations={"readOnlyHint": False})
     async def supersede_decision(
         old_path: str,
         new_title: str,
@@ -766,6 +907,457 @@ def register_tools(
             int((time.monotonic() - t0) * 1000),
         )
         return f"created: {rel_path} (supersedes {old_path})"
+
+    # ------------------------------------------------------------------
+    # Slot tools (Postgres-only scratchpad, per-agent UNIQUE(agent, label))
+    # ------------------------------------------------------------------
+
+    @gated_tool("slot_list", annotations={"readOnlyHint": True})
+    async def slot_list(
+        include_content: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+        ctx: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List slots for the authenticated agent.
+
+        Returns metadata-only by default (id, label, size, size_limit,
+        hard_cap, pinned, agent, created_at, updated_at, warning).
+        Set include_content=True to also return content.
+
+        Args:
+            include_content: When True, include content in each payload.
+            limit: Max rows to return; must be 1..1000.
+            offset: Rows to skip; must be >= 0.
+        """
+        t0 = time.monotonic()
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("offset must be an integer")
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        rows = await pool.fetch(
+            """
+            SELECT id, label, content, size_limit, hard_cap, pinned,
+                   agent, created_at, updated_at
+            FROM slots
+            WHERE agent = $1
+            ORDER BY pinned DESC, label ASC
+            LIMIT $2 OFFSET $3
+            """,
+            agent_ctx.agent,
+            limit,
+            offset,
+        )
+        result = [_slot_payload(r, include_content=include_content) for r in rows]
+        await log_audit(
+            pool, agent_ctx.agent, "slot_list",
+            {
+                "count": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "include_content": bool(include_content),
+            },
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return result
+
+    @gated_tool("slot_get", annotations={"readOnlyHint": True})
+    async def slot_get(
+        label: str,
+        ctx: dict[str, object] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a single slot payload for the authenticated agent, or None."""
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        normalized = _validate_slot_label(label)
+        row = await pool.fetchrow(
+            """
+            SELECT id, label, content, size_limit, hard_cap, pinned,
+                   agent, created_at, updated_at
+            FROM slots
+            WHERE agent = $1 AND label = $2
+            """,
+            agent_ctx.agent,
+            normalized,
+        )
+        await log_audit(
+            pool, agent_ctx.agent, "slot_get",
+            {"label": normalized, "found": row is not None},
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        if row is None:
+            return None
+        return _slot_payload(row, include_content=True)
+
+    @gated_tool(
+        "slot_create",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+        },
+    )
+    async def slot_create(
+        label: str,
+        content: str = "",
+        size_limit: int = DEFAULT_SLOT_SIZE_LIMIT,
+        hard_cap: int = DEFAULT_SLOT_HARD_CAP,
+        pinned: bool = False,
+        ctx: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Create a slot for the authenticated agent.
+
+        Raises:
+            ValueError: invalid label/limits or duplicate (agent, label).
+            PermissionError: missing 'slots' write scope, or 413 overflow.
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        _require_slots_write(agent_ctx)
+
+        normalized = _validate_slot_label(label)
+        size_limit, hard_cap = _validate_slot_limits(size_limit, hard_cap)
+        body = content if content is not None else ""
+
+        body_size = len(body.encode("utf-8"))
+
+        try:
+            _assert_slot_size(body, size_limit, hard_cap)
+        except PermissionError as exc:
+            await log_audit(
+                pool, agent_ctx.agent, "slot_create",
+                {
+                    "label": normalized,
+                    "size": body_size,
+                    "size_limit": size_limit,
+                    "pinned": bool(pinned),
+                },
+                "error", int((time.monotonic() - t0) * 1000),
+                error=str(exc),
+            )
+            raise
+
+        try:
+            row = await pool.fetchrow(
+                """
+                INSERT INTO slots
+                    (label, content, size_limit, hard_cap, pinned, agent,
+                     created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+                RETURNING id, label, content, size_limit, hard_cap, pinned,
+                          agent, created_at, updated_at
+                """,
+                normalized, body, size_limit, hard_cap, bool(pinned),
+                agent_ctx.agent,
+            )
+        except UniqueViolationError as exc:
+            await log_audit(
+                pool, agent_ctx.agent, "slot_create",
+                {
+                    "label": normalized,
+                    "size": body_size,
+                    "size_limit": size_limit,
+                    "pinned": bool(pinned),
+                },
+                "error", int((time.monotonic() - t0) * 1000),
+                error=f"duplicate slot: {normalized}",
+            )
+            raise ValueError(
+                f"slot already exists for agent={agent_ctx.agent!r} "
+                f"label={normalized!r}"
+            ) from exc
+
+        payload = _slot_payload(row, include_content=True)
+        await log_audit(
+            pool, agent_ctx.agent, "slot_create",
+            {
+                "label": normalized,
+                "size": payload["size"],
+                "size_limit": size_limit,
+                "pinned": bool(pinned),
+            },
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return payload
+
+    @gated_tool(
+        "slot_append",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+        },
+    )
+    async def slot_append(
+        label: str,
+        appended_content: str,
+        ctx: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Append content to an existing slot.
+
+        Inserts a single '\\n' separator only when existing content is nonempty
+        and does not already end with '\\n'.
+
+        Raises:
+            ValueError: invalid label, slot not found.
+            PermissionError: missing 'slots' write scope, or 413 overflow.
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        _require_slots_write(agent_ctx)
+        normalized = _validate_slot_label(label)
+        added = appended_content if appended_content is not None else ""
+        added_size = len(added.encode("utf-8"))
+
+        # Capture audit context for rejected-path: build outside the
+        # pool.acquire() block so a failed write does not hold a connection
+        # while waiting for an audit-log connection (deadlock guard, H2).
+        rejected_error: str | None = None
+        updated: Any | None = None
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, label, content, size_limit, hard_cap, pinned,
+                           agent, created_at, updated_at
+                    FROM slots
+                    WHERE agent = $1 AND label = $2
+                    FOR UPDATE
+                    """,
+                    agent_ctx.agent, normalized,
+                )
+                if row is None:
+                    rejected_error = f"slot not found: {normalized}"
+                else:
+                    existing = row["content"] or ""
+                    size_limit = int(row["size_limit"])
+                    hard_cap = int(row["hard_cap"])
+
+                    if not existing:
+                        new_content = added
+                    elif existing.endswith("\n"):
+                        new_content = existing + added
+                    else:
+                        new_content = existing + "\n" + added
+
+                    try:
+                        _assert_slot_size(new_content, size_limit, hard_cap)
+                    except PermissionError as exc:
+                        rejected_error = str(exc)
+                    else:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE slots
+                            SET content = $3, updated_at = now()
+                            WHERE agent = $1 AND label = $2
+                            RETURNING id, label, content, size_limit, hard_cap, pinned,
+                                      agent, created_at, updated_at
+                            """,
+                            agent_ctx.agent, normalized, new_content,
+                        )
+
+        if rejected_error is not None:
+            await log_audit(
+                pool, agent_ctx.agent, "slot_append",
+                {"label": normalized, "added": added_size},
+                "error", int((time.monotonic() - t0) * 1000),
+                error=rejected_error,
+            )
+            if rejected_error.startswith("413"):
+                raise PermissionError(rejected_error)
+            raise ValueError(
+                f"slot not found for agent={agent_ctx.agent!r} "
+                f"label={normalized!r}"
+            )
+
+        payload = _slot_payload(updated, include_content=True)
+        await log_audit(
+            pool, agent_ctx.agent, "slot_append",
+            {
+                "label": normalized,
+                "added": added_size,
+                "size": payload["size"],
+            },
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return payload
+
+    @gated_tool(
+        "slot_replace",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+        },
+    )
+    async def slot_replace(
+        label: str,
+        content: str,
+        ctx: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Replace a slot's content entirely.
+
+        Raises:
+            ValueError: invalid label, slot not found.
+            PermissionError: missing 'slots' write scope, or 413 overflow.
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        _require_slots_write(agent_ctx)
+        normalized = _validate_slot_label(label)
+        body = content if content is not None else ""
+        body_size = len(body.encode("utf-8"))
+
+        # Capture audit context for rejected-path: build outside the
+        # pool.acquire() block so a failed write does not hold a connection
+        # while waiting for an audit-log connection (deadlock guard, H2).
+        rejected_error: str | None = None
+        before_size: int = 0
+        updated: Any | None = None
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, label, content, size_limit, hard_cap, pinned,
+                           agent, created_at, updated_at
+                    FROM slots
+                    WHERE agent = $1 AND label = $2
+                    FOR UPDATE
+                    """,
+                    agent_ctx.agent, normalized,
+                )
+                if row is None:
+                    rejected_error = f"slot not found: {normalized}"
+                else:
+                    size_limit = int(row["size_limit"])
+                    hard_cap = int(row["hard_cap"])
+                    before_size = len((row["content"] or "").encode("utf-8"))
+
+                    try:
+                        _assert_slot_size(body, size_limit, hard_cap)
+                    except PermissionError as exc:
+                        rejected_error = str(exc)
+                    else:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE slots
+                            SET content = $3, updated_at = now()
+                            WHERE agent = $1 AND label = $2
+                            RETURNING id, label, content, size_limit, hard_cap, pinned,
+                                      agent, created_at, updated_at
+                            """,
+                            agent_ctx.agent, normalized, body,
+                        )
+
+        if rejected_error is not None:
+            await log_audit(
+                pool, agent_ctx.agent, "slot_replace",
+                {
+                    "label": normalized,
+                    "before": before_size,
+                    "after": body_size,
+                },
+                "error", int((time.monotonic() - t0) * 1000),
+                error=rejected_error,
+            )
+            if rejected_error.startswith("413"):
+                raise PermissionError(rejected_error)
+            raise ValueError(
+                f"slot not found for agent={agent_ctx.agent!r} "
+                f"label={normalized!r}"
+            )
+
+        payload = _slot_payload(updated, include_content=True)
+        await log_audit(
+            pool, agent_ctx.agent, "slot_replace",
+            {
+                "label": normalized,
+                "before": before_size,
+                "after": payload["size"],
+            },
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return payload
+
+    @gated_tool(
+        "slot_delete",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
+    )
+    async def slot_delete(
+        label: str,
+        ctx: dict[str, object] | None = None,
+    ) -> str:
+        """Delete the authenticated agent's slot. Returns 'deleted: <label>'.
+
+        Raises:
+            ValueError: slot not found.
+            PermissionError: missing 'slots' write scope.
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_for_slots(ctx, pool)
+        _require_slots_write(agent_ctx)
+        normalized = _validate_slot_label(label)
+
+        # Capture audit context for rejected-path: build outside the
+        # pool.acquire() block so a failed write does not hold a connection
+        # while waiting for an audit-log connection (deadlock guard, H2).
+        rejected_error: str | None = None
+        size: int = 0
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, content FROM slots
+                    WHERE agent = $1 AND label = $2
+                    FOR UPDATE
+                    """,
+                    agent_ctx.agent, normalized,
+                )
+                if row is None:
+                    rejected_error = f"slot not found: {normalized}"
+                else:
+                    size = len((row["content"] or "").encode("utf-8"))
+                    await conn.execute(
+                        "DELETE FROM slots WHERE agent = $1 AND label = $2",
+                        agent_ctx.agent, normalized,
+                    )
+
+        if rejected_error is not None:
+            await log_audit(
+                pool, agent_ctx.agent, "slot_delete",
+                {"label": normalized},
+                "error", int((time.monotonic() - t0) * 1000),
+                error=rejected_error,
+            )
+            raise ValueError(
+                f"slot not found for agent={agent_ctx.agent!r} "
+                f"label={normalized!r}"
+            )
+
+        await log_audit(
+            pool, agent_ctx.agent, "slot_delete",
+            {"label": normalized, "size": size},
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        return f"deleted: {normalized}"
 
 
 # ---------------------------------------------------------------------------

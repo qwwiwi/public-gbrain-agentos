@@ -1,6 +1,9 @@
 """Shared configuration for gbrain services."""
+import math
 import os
 from dataclasses import dataclass, field
+
+from services.shared.tool_gating import parse_tool_set
 
 
 def _require_pg_password() -> str:
@@ -20,6 +23,76 @@ def _require_pg_password() -> str:
             "PG_PASSWORD manually before starting services."
         )
     return pw
+
+
+def _env_float(name: str, default: str, min_value: float = 0.0) -> float:
+    """Parse a float env var with a default and a lower bound.
+
+    Args:
+        name: Environment variable name.
+        default: Default string value used when the env var is unset.
+        min_value: Minimum allowed numeric value (inclusive).
+
+    Returns:
+        Parsed float.
+
+    Raises:
+        RuntimeError: If the value is not a float or is below ``min_value``.
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{name} must be a float, got: {raw!r}"
+        ) from exc
+    if not math.isfinite(value):
+        raise RuntimeError(
+            f"{name} must be finite, got {raw!r}"
+        )
+    if value < min_value:
+        raise RuntimeError(
+            f"{name} must be >= {min_value}, got: {value}"
+        )
+    return value
+
+
+def _env_int(
+    name: str,
+    default: str,
+    min_value: int = 0,
+    max_value: int | None = None,
+) -> int:
+    """Parse an int env var with a default and inclusive bounds.
+
+    Args:
+        name: Environment variable name.
+        default: Default string value used when the env var is unset.
+        min_value: Minimum allowed integer (inclusive).
+        max_value: Optional maximum allowed integer (inclusive).
+
+    Returns:
+        Parsed int.
+
+    Raises:
+        RuntimeError: If the value is not an int or is out of range.
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{name} must be an int, got: {raw!r}"
+        ) from exc
+    if value < min_value:
+        raise RuntimeError(
+            f"{name} must be >= {min_value}, got: {value}"
+        )
+    if max_value is not None and value > max_value:
+        raise RuntimeError(
+            f"{name} must be <= {max_value}, got: {value}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -56,6 +129,20 @@ class Config:
     )
     mcp_port: int = field(
         default_factory=lambda: int(os.environ["MCP_PORT"])
+    )
+    gbrain_tools: str = field(
+        default_factory=lambda: parse_tool_set(os.environ.get("GBRAIN_TOOLS"))
+    )
+    rrf_weight_bm25: float = field(
+        default_factory=lambda: _env_float("GBRAIN_RRF_WEIGHT_BM25", "0.4")
+    )
+    rrf_weight_vec: float = field(
+        default_factory=lambda: _env_float("GBRAIN_RRF_WEIGHT_VEC", "0.6")
+    )
+    diversify_max: int = field(
+        default_factory=lambda: _env_int(
+            "GBRAIN_DIVERSIFY_MAX", "0", min_value=0, max_value=100
+        )
     )
 
     def get_pg_dsn(self) -> dict[str, str | int]:

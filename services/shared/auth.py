@@ -37,6 +37,7 @@ async def authenticate(token: str, pool: asyncpg.Pool) -> AgentContext:
         SELECT agent, can_write_scopes, can_read_scopes
         FROM agent_tokens
         WHERE token_sha256 = $1
+          AND revoked_at IS NULL
         """,
         token_hash,
     )

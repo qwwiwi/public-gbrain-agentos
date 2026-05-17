@@ -66,7 +66,7 @@ async def _get_pool() -> object:
     return await get_pool(config)
 
 
-register_tools(mcp, config.vault_root, _get_pool)
+register_tools(mcp, config.vault_root, _get_pool, tool_set=config.gbrain_tools)
 
 
 class AuthCaptureMiddleware:

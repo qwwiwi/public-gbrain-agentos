@@ -39,6 +39,11 @@ _embed_model: Any = None
 _cache: RecallCache = RecallCache()
 _vault_root: Path = Path("/opt/gbrain/vault")
 
+# Module-level config: read once so register_tools can see env-driven values.
+# Lifespan() refreshes _vault_root from a fresh Config() at startup if the
+# environment changes between import and run.
+config = Config(mcp_port=int(os.environ.get("MCP_PORT", str(DEFAULT_PORT))))
+
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
@@ -100,7 +105,17 @@ mcp = FastMCP(
     lifespan=lifespan,
 )
 
-register_tools(mcp, _get_pool, _get_embed, _get_cache, _get_vault_root)
+register_tools(
+    mcp,
+    _get_pool,
+    _get_embed,
+    _get_cache,
+    _get_vault_root,
+    tool_set=config.gbrain_tools,
+    rrf_weight_bm25=config.rrf_weight_bm25,
+    rrf_weight_vec=config.rrf_weight_vec,
+    diversify_max=config.diversify_max,
+)
 
 
 class AuthCaptureMiddleware:

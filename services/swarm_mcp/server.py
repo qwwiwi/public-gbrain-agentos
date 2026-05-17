@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.shared.config import Config
 from services.shared.db import close_pool, get_pool
 from services.shared.audit import log_audit
+from services.shared.tool_gating import parse_tool_set, should_register_tool
 
 from . import outbox
 
@@ -71,6 +72,26 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, object]]:
 
 mcp = FastMCP("swarm-mcp", lifespan=lifespan)
 
+# Tool gating: parse GBRAIN_TOOLS once at import time. `core` exposes only
+# always-on tools (notify, ack). `all` exposes the full swarm surface.
+_TOOL_SET = parse_tool_set(os.environ.get("GBRAIN_TOOLS"))
+
+
+# In skip-mode the function still lives in the closure but is NOT recorded on `mcp` — clients cannot invoke it.
+def _gated_tool(tool_name: str, **kwargs):
+    """Decorator that registers a tool only when permitted by GBRAIN_TOOLS.
+
+    Returns either `mcp.tool(...)` or an identity decorator so the underlying
+    coroutine remains importable and callable from Python regardless of mode.
+    """
+    if should_register_tool("swarm_mcp", tool_name, _TOOL_SET):
+        return mcp.tool(**kwargs)
+
+    def _identity(fn):
+        return fn
+
+    return _identity
+
 
 async def _get_pool() -> asyncpg.Pool:
     config = Config(mcp_port=int(os.environ.get("MCP_PORT", str(DEFAULT_PORT))))
@@ -114,7 +135,7 @@ async def _resolve_caller(ctx: Any, pool: asyncpg.Pool) -> str:
     return row["agent"]
 
 
-@mcp.tool()
+@_gated_tool("notify")
 async def notify(
     to_agent: str,
     payload: dict[str, Any],
@@ -133,7 +154,7 @@ async def notify(
     return {"task_id": tid, "status": "pending"}
 
 
-@mcp.tool()
+@_gated_tool("ack")
 async def ack(task_id: str, ctx: Any = None) -> dict[str, Any]:
     """Acknowledge a delivery — moves status to acked. Idempotent."""
     pool = await _get_pool()
@@ -144,7 +165,7 @@ async def ack(task_id: str, ctx: Any = None) -> dict[str, Any]:
     return {"task_id": task_id, "acked": ok}
 
 
-@mcp.tool()
+@_gated_tool("broadcast")
 async def broadcast(
     agents: list[str],
     payload: dict[str, Any],
@@ -162,7 +183,7 @@ async def broadcast(
     return {"task_ids": task_ids}
 
 
-@mcp.tool()
+@_gated_tool("escalate")
 async def escalate(
     to_agent: str,
     payload: dict[str, Any],
@@ -180,7 +201,7 @@ async def escalate(
     return {"task_id": tid, "status": "pending", "priority": "high"}
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
+@_gated_tool("stats", annotations={"readOnlyHint": True})
 async def stats(ctx: Any = None) -> dict[str, Any]:
     """Return delivery_outbox counts per status."""
     pool = await _get_pool()
@@ -188,7 +209,7 @@ async def stats(ctx: Any = None) -> dict[str, Any]:
     return await outbox.get_stats(pool)
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
+@_gated_tool("get_delivery", annotations={"readOnlyHint": True})
 async def get_delivery(task_id: str, ctx: Any = None) -> dict[str, Any] | None:
     """Inspect a single delivery by task_id."""
     pool = await _get_pool()
@@ -196,7 +217,7 @@ async def get_delivery(task_id: str, ctx: Any = None) -> dict[str, Any] | None:
     return await outbox.get_row(pool, task_id)
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
+@_gated_tool("list_recent_deliveries", annotations={"readOnlyHint": True})
 async def list_recent_deliveries(
     limit: int = 50,
     status_filter: str | None = None,
@@ -212,7 +233,7 @@ async def list_recent_deliveries(
     return await outbox.list_recent(pool, limit, status_filter)
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
+@_gated_tool("list_my_pending", annotations={"readOnlyHint": True})
 async def list_my_pending(limit: int = 20, ctx: Any = None) -> list[dict[str, Any]]:
     """Pull-based delivery: return pending deliveries addressed to the calling agent.
 
