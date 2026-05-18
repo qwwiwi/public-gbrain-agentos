@@ -32,10 +32,10 @@ if [ ! -r /etc/os-release ]; then
 fi
 # shellcheck disable=SC1091
 . /etc/os-release
-if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "22.04" ]; then
-  die "unsupported platform: ID=${ID:-?} VERSION_ID=${VERSION_ID:-?} (need ubuntu 22.04)"
+if [ "${ID:-}" != "ubuntu" ] || { [ "${VERSION_ID:-}" != "22.04" ] && [ "${VERSION_ID:-}" != "24.04" ]; }; then
+  die "unsupported platform: ID=${ID:-?} VERSION_ID=${VERSION_ID:-?} (need ubuntu 22.04 or 24.04)"
 fi
-log "platform ok: ubuntu 22.04"
+log "platform ok: ubuntu ${VERSION_ID}"
 
 if [ "$(id -u)" -ne 0 ]; then
   die "must run as root (sudo bash scripts/install.sh)"
@@ -105,7 +105,7 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
   install -d /usr/share/keyrings
   curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     | gpg --dearmor -o /usr/share/keyrings/postgresql-archive-keyring.gpg
-  echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt jammy-pgdg main" \
+  echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
     > /etc/apt/sources.list.d/pgdg.list
   apt-get update -y
 fi
@@ -268,6 +268,10 @@ LOG_DIR=$LOG_DIR
 STATE_DIR=$STATE_DIR
 FASTEMBED_CACHE_DIR=$STATE_DIR/fastembed
 EOF
+# Bind MCP servers to loopback only (Caddy fronts them). Kept out of the
+# heredoc above so a re-run's `cat >` overwrite is followed by exactly one
+# append — idempotent, no duplicate MCP_HOST lines accumulate.
+echo "MCP_HOST=127.0.0.1" >> "$ETC_DIR/secrets.env"
 chmod 600 "$ETC_DIR/secrets.env"
 chown "$SERVICE_USER":"$SERVICE_USER" "$ETC_DIR/secrets.env"
 log "wrote $ETC_DIR/secrets.env (review and add provider API keys as needed)"
@@ -447,13 +451,9 @@ cat <<EOF
 
 gbrain install complete.
 
-Admin token (one-time print, also at $ADMIN_TOKEN_FILE mode 0600):
-
 EOF
 
-if [ -s "$ADMIN_TOKEN_FILE" ]; then
-  cat "$ADMIN_TOKEN_FILE"
-fi
+log "admin token written to $ADMIN_TOKEN_FILE. Read: sudo cat $ADMIN_TOKEN_FILE"
 
 cat <<EOF
 
