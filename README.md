@@ -33,7 +33,7 @@
 | **Persistent vault** | Plain markdown на диске VPS. 12 scope'ов (10-strategy, 20-daily, 30-decisions, 40-learnings, 50-external, 60-handoff, 70-runbooks, 80-error-patterns, 90-inbox, 95-artifacts, 99-archive). Не теряется при `/clear`, `/compact` или смерти сессии. |
 | **Гибридный recall** | Семантический поиск (FastEmbed multilingual-e5-large, 1024-dim) + лексический FTS (Postgres tsvector), слиты через Reciprocal Rank Fusion, переранжированы по типу и свежести. Один MCP-вызов `recall(query, limit=N)` — получаешь top-N релевантных markdown'ов с метаданными. |
 | **Scoped write API** | 5 типов нот: decisions, runbooks, error-patterns, daily logs, external. Каждая идёт в свою папку с frontmatter, sha256-дедупликацией и audit_log. Scope-based RBAC: inbox-agent не может писать decisions, coder не может писать в archive. |
-| **Inter-agent шина** | swarm_mcp: notify, list_my_pending, ack, broadcast, escalate. Любой агент может разбудить другого через payload + Bearer (или через webhook → gateway → новая Claude-сессия запускается автоматически). |
+| **Inter-agent шина** | swarm_mcp: notify, list_my_pending, ack, broadcast, escalate. Любой агент будит другого через `notify(to_agent, payload)` — swarm worker делает POST на webhook listener целевого агента (`AGENT_GATEWAYS` env), и payload приземляется в активную сессию ≤30s. Два готовых receiver-pattern: Claude Code (через jarvis-channel plugin) и Hermes Agent (через локальный aiohttp listener + launchd). Полный flow и шаблоны: [docs/INTER-AGENT-WEBHOOKS.md](docs/INTER-AGENT-WEBHOOKS.md). |
 | **Tasks state machine** | task_mcp: `new → progress → review → done` (+ `blocked`). task_history (audit trail), agent heartbeat с metadata (host/role/model/version). 13 MCP-тулов покрывают весь жизненный цикл. |
 | **Identity и audit** | Каждый агент — Bearer-токен в `agent_tokens` (sha256 stored, raw printed once). ASGI middleware `AuthCaptureMiddleware` кладёт identity в ContextVar — no silent fallback. Каждая запись logged в `audit_log` с `agent`, `action`, `timestamp`, `payload_sha256`. |
 | **HMAC dual-auth** | Параллельный путь аутентификации для Hermes Agent: `X-Hermes-Signature` + `X-Hermes-Timestamp` поверх HMAC-SHA256(`<timestamp>.<body>`). Constant-time compare, 5-минутный tolerance. Same scopes, same RBAC. |
@@ -134,6 +134,90 @@
 **Vault — каноничен.** Plain markdown на файловой системе. Postgres — индекс, не источник. Потерял БД → переэмбеддил из markdown за 5 минут. Потерял vault → проблема — делай бэкап.
 
 В Путь B каждый persональный workspace **тоже** plain markdown (SOUL, rules, decisions, handoff). Можно `tar`-нуть, перенести на другую машину, направить на тот же мозг и продолжить.
+
+---
+
+## Триггеры между агентами (inter-agent webhooks)
+
+**Зачем это.** Если ты гоняешь 2+ агентов и хочешь чтобы они работали как команда, а не как набор изолированных терминалов — нужен механизм когда агент A автономно будит агента B с задачей. Иначе каждый trigger требует человека-посредника, и тебе придётся самому пересылать «координатор сказал, кодер сделай вот это» — это убивает смысл многоагентной системы.
+
+**gbrain делает это через webhook-доставку поверх swarm_mcp.** Один MCP-вызов — и доставка происходит автоматически за ≤30s без cron, без polling, без участия человека. Принцип agent-native: API между агентами, не GUI.
+
+### Архитектура (полный flow)
+
+```
+Агент A (любой runtime)
+    │
+    │ mcp__gbrain-swarm__notify(to_agent="B", payload={...})
+    ▼
+swarm_mcp server (VPS)
+    │
+    │ enqueue в outbox (state machine: pending → delivered → acked|failed)
+    ▼
+swarm_mcp worker (VPS)
+    │
+    │ читает AGENT_GATEWAYS["B"] → POST {url}/webhook
+    │ + Authorization: Bearer ИЛИ X-Hermes-Signature + X-Hermes-Timestamp
+    │ + JSON body с payload
+    ▼
+Webhook listener агента B (его runtime)
+    │
+    │ verify auth → парсит payload → инжектит в активную сессию
+    ▼
+Сессия агента B получает trigger
+    │
+    │ читает task из gbrain → выполняет → mcp__gbrain-swarm__ack(task_id)
+    ▼
+outbox запись помечена acked, цикл закрыт
+```
+
+### Два готовых receiver-pattern
+
+**1. Claude Code через jarvis-channel plugin** — для агентов которые живут в `claude` CLI сессии.
+
+Plugin [`qwwiwi/dashi-plugin-claude-code`](https://github.com/qwwiwi/dashi-plugin-claude-code) поднимает HTTP listener (typically `:8089`), принимает webhook от swarm worker, инжектит payload как сообщение прямо в активную Claude Code сессию. Та обрабатывает как обычный пользовательский ввод, видит tools, отвечает. Deploy: один `npm install` + systemd unit (Linux) или launchd plist (macOS). Reverse SSH tunnel если listener за NAT.
+
+**2. Hermes Agent через локальный aiohttp listener** — для агентов на [Hermes Agent](https://github.com/NousResearch/hermes-agent) фреймворке.
+
+Hermes — это Telegram polling-bot, у него нет native webhook endpoint. Pattern: отдельный Python aiohttp/FastAPI listener стоит рядом с Hermes daemon (typically `127.0.0.1:8091`), принимает POST `/webhook`, верифицирует Bearer или HMAC, пишет payload в `~/.hermes/inbox/{timestamp}.json`. Hermes daemon забирает inbox через свой message handler. launchd plist обеспечивает KeepAlive после reboot. Шаблон listener: [`agent-template/scripts/webhook_listener.py`](agent-template/scripts/webhook_listener.py).
+
+**Кастомный runtime?** Любой HTTP-listener поверх любого фреймворка подойдёт. Требования: POST `/webhook`, verify Bearer/HMAC, inject в твою runtime сессию. См. [docs/INTER-AGENT-WEBHOOKS.md](docs/INTER-AGENT-WEBHOOKS.md) — там reference implementation на ~80 строк aiohttp.
+
+### Setup нового агента — 3 шага
+
+1. **Deploy listener** для своего runtime (jarvis-channel ИЛИ Hermes ИЛИ кастом). Listener держит порт на localhost, верифицирует Bearer/HMAC, инжектит payload в сессию.
+2. **Зарегистрируй URL** в swarm worker на VPS — drop-in env `AGENT_GATEWAYS` в `/etc/systemd/system/gbrain-swarm-worker.service.d/webhook.conf`:
+   ```
+   AGENT_GATEWAYS={"alice":"http://127.0.0.1:8089/webhook","bob":"http://127.0.0.1:8091/webhook"}
+   ```
+   Опционально `AGENT_GATEWAY_AUTH` для per-agent secrets (см. §7 в [docs/hermes-integration.md](docs/hermes-integration.md)). Затем `sudo systemctl restart gbrain-swarm-worker`.
+3. **Smoke test**:
+   ```python
+   mcp__gbrain-swarm__notify(to_agent="alice", payload={"type":"ping","from":"tester"})
+   mcp__gbrain-swarm__get_delivery(task_id="<returned>")  # ожидаем status=acked
+   ```
+
+### Безопасность
+
+- **Auth обязателен.** Bearer (sha256 в `agent_tokens`) ИЛИ HMAC (per-request signature). Plaintext webhook без auth = открытый RCE.
+- **Listener bind на 127.0.0.1**, не `0.0.0.0`. Если worker на VPS, а listener на ноутбуке — используй reverse SSH tunnel (`autossh -R 8091:127.0.0.1:8091`) или Tailscale. Не выставляй listener в публичный интернет.
+- **Bot isolation hard rule.** Если у твоих агентов есть Telegram-боты — каждый агент использует ТОЛЬКО свой бот. Worker НЕ должен отправлять через чужие bot tokens как обходной путь.
+- **Output filter.** Любое логирование payload — через redact pattern (Bearer, токены, секреты). См. ошибки от которых мы защищались: [docs/INTER-AGENT-WEBHOOKS.md#security](docs/INTER-AGENT-WEBHOOKS.md#security).
+
+### Debugging
+
+```python
+# Куда делась доставка?
+mcp__gbrain-swarm__get_delivery(task_id="<id>")
+# → status: pending|delivered|acked|failed, attempts, last_error, next_retry_at
+
+# Worker логи на VPS:
+journalctl -u gbrain-swarm-worker --since "10 min ago" | grep <agent-name>
+
+# Retries: 5 attempts с exponential backoff, потом status=failed (нужен ручной replay).
+```
+
+Полный мануал с code snippets, runtime-specific recipes, troubleshooting матрицей: [docs/INTER-AGENT-WEBHOOKS.md](docs/INTER-AGENT-WEBHOOKS.md).
 
 ---
 
@@ -254,6 +338,35 @@ python scripts/issue-hmac-secret.py --agent <agent-id>
 ```
 
 Полный walkthrough + примеры подписания: `docs/hermes-integration.md`.
+
+#### Inbound webhook (приём триггеров от других агентов)
+
+Hermes — это Telegram polling-bot, у него **нет native webhook endpoint**. Чтобы другие агенты могли триггерить Hermes через `mcp__gbrain-swarm__notify(to_agent="<hermes-agent-id>", ...)`, рядом с Hermes daemon ставится отдельный Python aiohttp listener:
+
+```
+swarm worker (VPS)                         Hermes host (Mac mini / Linux)
+    │                                              │
+    │  POST http://<host>:8091/webhook             │
+    │  Authorization: Bearer <token>               │
+    │  body: {"type":"task_assigned",...}          │
+    ├─────────────reverse SSH tunnel──────────────►│
+    │  -R 8091:127.0.0.1:8091                      │
+    │                                              ▼
+    │                                       webhook_listener.py
+    │                                       (aiohttp, :8091)
+    │                                              │
+    │                                              │ verify Bearer / HMAC
+    │                                              │ write ~/.hermes/inbox/{ts}.json
+    │                                              ▼
+    │                                       Hermes daemon
+    │                                       читает inbox/ → trigger
+```
+
+Шаблон listener'а: [`agent-template/scripts/webhook_listener.py`](agent-template/scripts/webhook_listener.py) — минимальный aiohttp на ~80 строк с Bearer/HMAC verify и inbox dispatch. Запускается через launchd (macOS) или systemd (Linux), `KeepAlive=true` для рестарта после reboot.
+
+После запуска listener'а — зарегистрируй URL в swarm worker `AGENT_GATEWAYS` (см. раздел «[Триггеры между агентами](#триггеры-между-агентами-inter-agent-webhooks)» выше) и сделай smoke `notify` для проверки.
+
+Полный setup с reverse SSH tunnel, launchd plist примером, debugging-матрицей: [docs/INTER-AGENT-WEBHOOKS.md](docs/INTER-AGENT-WEBHOOKS.md) разделы «Receiver: Hermes Agent» и «Setup: macOS launchd».
 
 ---
 
