@@ -38,6 +38,15 @@ SQL_UPDATE_STATUS = """
     WHERE id = $1
 """
 
+# Remove stale sibling jobs for the same doc_id before transitioning status.
+# Without this, the unique (doc_id, status) constraint can collide with
+# leftover rows from earlier runs (e.g. a prior completed/failed entry),
+# making SQL_UPDATE_STATUS raise UniqueViolationError and crash the worker.
+SQL_CLEANUP_STALE_JOBS = """
+    DELETE FROM embedding_jobs
+    WHERE doc_id = $1 AND id <> $2
+"""
+
 SQL_DELETE_CHUNKS = """
     DELETE FROM chunks WHERE doc_id = $1
 """
@@ -151,6 +160,14 @@ async def run_worker() -> None:
                                     "Shutdown requested, stopping mid-batch"
                                 )
                                 break
+                            # Run cleanup outside the savepoint so it
+                            # persists even if processing rolls back and we
+                            # update the row to 'failed'.
+                            await conn.execute(
+                                SQL_CLEANUP_STALE_JOBS,
+                                row["doc_id"],
+                                row["id"],
+                            )
                             sp = conn.transaction()
                             await sp.start()
                             try:
