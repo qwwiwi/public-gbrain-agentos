@@ -994,3 +994,48 @@ class TestProbeScopeCli:
         )
         assert code == 0
         assert captured["probe_scope"] is None
+
+
+class TestDeliveryWindow:
+    """G7 windowing: only deliveries updated within the window count toward
+    the failure ratio; stale rows (already-fixed causes) are excluded."""
+
+    def _cl(self):
+        try:
+            import checks_local
+        except Exception:  # pragma: no cover — module may land later
+            pytest.skip("checks_local not present")
+        return checks_local
+
+    def _iso(self, hours_ago):
+        from datetime import datetime, timedelta, timezone
+
+        return (
+            datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        ).isoformat()
+
+    def test_recent_within_window(self):
+        cl = self._cl()
+        assert cl._delivery_within_window({"updated_at": self._iso(1)}, 6) is True
+
+    def test_old_outside_window(self):
+        cl = self._cl()
+        assert cl._delivery_within_window({"updated_at": self._iso(10)}, 6) is False
+
+    def test_z_suffix_parsed(self):
+        cl = self._cl()
+        ts = self._iso(1).replace("+00:00", "Z")
+        assert cl._delivery_within_window({"updated_at": ts}, 6) is True
+
+    def test_missing_timestamp_not_hidden(self):
+        cl = self._cl()
+        # No timestamp -> never silently excluded.
+        assert cl._delivery_within_window({}, 6) is True
+
+    def test_unparseable_timestamp_not_hidden(self):
+        cl = self._cl()
+        assert cl._delivery_within_window({"updated_at": "not-a-date"}, 6) is True
+
+    def test_falls_back_to_created_at(self):
+        cl = self._cl()
+        assert cl._delivery_within_window({"created_at": self._iso(10)}, 6) is False

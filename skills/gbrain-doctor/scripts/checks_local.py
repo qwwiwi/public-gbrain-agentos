@@ -836,8 +836,43 @@ def _coerce_delivery_list(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+# Only deliveries updated within this window count toward the failure ratio.
+# A ``failed`` row's cause may already be fixed (e.g. a since-corrected gateway
+# route); without a window those stale rows keep the ratio red forever, because
+# ``list_recent_deliveries`` returns by ``created_at`` and the denominator only
+# grows as new acked rows appear. Windowing on ``updated_at`` makes the metric
+# reflect *current* health.
+_DELIVERY_WINDOW_HOURS = 6
+
+
+def _delivery_within_window(row: dict, hours: int = _DELIVERY_WINDOW_HOURS) -> bool:
+    """Whether a delivery row was last touched within ``hours``.
+
+    Reads ``updated_at`` (falling back to ``created_at``) as an ISO-8601
+    timestamp. A missing or unparseable timestamp returns ``True`` so the row
+    is never silently hidden — we only ever *exclude* a row we can prove is old.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    ts = row.get("updated_at") or row.get("created_at")
+    if not isinstance(ts, str) or not ts:
+        return True
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return dt >= cutoff
+
+
 def _check_webhook_delivery_errors(ctx: "DoctorContext") -> CheckResult:
-    """C039 — recent self-addressed deliveries show no recurring webhook errors."""
+    """C039 — recent self-addressed deliveries show no recurring webhook errors.
+
+    Only deliveries updated within :data:`_DELIVERY_WINDOW_HOURS` count toward
+    the failure ratio, so a since-fixed cause does not keep the check red.
+    """
     name = "G7.webhook_delivery_errors"
     swarm = ctx.server("swarm")
     if swarm is None:
@@ -872,12 +907,36 @@ def _check_webhook_delivery_errors(ctx: "DoctorContext") -> CheckResult:
         )
 
     rows = _coerce_delivery_list(payload)
-    mine = [r for r in rows if r.get("to_agent") == ctx.agent]
-    if not mine:
+    mine_all = [r for r in rows if r.get("to_agent") == ctx.agent]
+    if not mine_all:
         return CheckResult(
             name=name, status="pass",
             message=redact.redact(
                 f"no recent deliveries addressed to {ctx.agent} (nothing to fault)"
+            ),
+        )
+
+    # Window to current health: ignore deliveries whose cause may already be
+    # fixed. Stale failures are surfaced as context, never as the verdict.
+    window_h = _DELIVERY_WINDOW_HOURS
+    mine = [r for r in mine_all if _delivery_within_window(r, window_h)]
+    stale_failed = sum(
+        1
+        for r in mine_all
+        if r.get("status") == "failed" and not _delivery_within_window(r, window_h)
+    )
+    stale_note = (
+        f" ({stale_failed} older failed outside {window_h}h window ignored)"
+        if stale_failed
+        else ""
+    )
+
+    if not mine:
+        return CheckResult(
+            name=name, status="pass",
+            message=redact.redact(
+                f"no deliveries to {ctx.agent} in last {window_h}h"
+                f"{stale_note}"
             ),
         )
 
@@ -886,7 +945,8 @@ def _check_webhook_delivery_errors(ctx: "DoctorContext") -> CheckResult:
         return CheckResult(
             name=name, status="pass",
             message=redact.redact(
-                f"{len(mine)} recent deliveries to {ctx.agent}, none failed"
+                f"{len(mine)} deliveries to {ctx.agent} in last {window_h}h, "
+                f"none failed{stale_note}"
             ),
         )
 
@@ -914,8 +974,8 @@ def _check_webhook_delivery_errors(ctx: "DoctorContext") -> CheckResult:
     return CheckResult(
         name=name, status=status,
         message=redact.redact(
-            f"{len(failed)}/{len(mine)} recent deliveries to {ctx.agent} failed "
-            f"({ratio:.0%})"
+            f"{len(failed)}/{len(mine)} deliveries to {ctx.agent} in last "
+            f"{window_h}h failed ({ratio:.0%}){stale_note}"
         ),
         remediation=hint,
     )
