@@ -47,6 +47,8 @@ import gbrain_doctor  # noqa: E402
 from gbrain_doctor import (  # noqa: E402
     DoctorContext,
     McpServer,
+    _infer_service,
+    _infer_service_from_key,
     _parse_groups,
     load_mcp_config,
     main,
@@ -440,6 +442,37 @@ class TestConfigLoader:
         with pytest.raises(SystemExit) as ei:
             load_mcp_config(str(_FIXTURES / "mcp-malformed.json"), None)
         assert ei.value.code == 2
+
+    def test_loads_port_based_mcp_json(self):
+        # Port-based topology: every server shares the ``/mcp`` path and the
+        # service is encoded only in the config key. The unknown ``some-other``
+        # server must still be skipped.
+        servers, _ = load_mcp_config(
+            str(_FIXTURES / "mcp-port-based.json"), None
+        )
+        services = sorted(s.service for s in servers)
+        assert services == ["memory", "recall", "swarm"]
+
+
+class TestServiceInference:
+    def test_infer_service_from_path(self):
+        assert _infer_service("https://h/memory/mcp") == "memory"
+        assert _infer_service("https://h/swarm/mcp") == "swarm"
+        assert _infer_service("https://h/task/mcp") == "tasks"
+
+    def test_infer_service_path_none_for_bare_mcp(self):
+        # Port-based URL has no service segment in the path.
+        assert _infer_service("http://127.0.0.1:8767/mcp") is None
+
+    def test_infer_service_from_key(self):
+        assert _infer_service_from_key("gbrain-memory") == "memory"
+        assert _infer_service_from_key("gbrain-recall") == "recall"
+        assert _infer_service_from_key("gbrain-swarm") == "swarm"
+        assert _infer_service_from_key("gbrain-task") == "tasks"
+
+    def test_infer_service_from_key_ignores_unknown(self):
+        assert _infer_service_from_key("some-other-mcp") is None
+        assert _infer_service_from_key("openai") is None
 
 
 class TestGroupParser:

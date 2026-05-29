@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "gbrain-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:8767/mcp",
+      "headers": {"Authorization": "Bearer test-token-aaaaaaaaaaaa"}
+    },
+    "gbrain-recall": {
+      "type": "http",
+      "url": "http://127.0.0.1:8768/mcp",
+      "headers": {"Authorization": "Bearer test-token-aaaaaaaaaaaa"}
+    },
+    "gbrain-swarm": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp",
+      "headers": {"Authorization": "Bearer test-token-aaaaaaaaaaaa"}
+    },
+    "some-other-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:9999/mcp",
+      "headers": {"Authorization": "Bearer test-token-aaaaaaaaaaaa"}
+    }
+  }
+}

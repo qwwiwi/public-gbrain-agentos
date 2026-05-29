@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +103,26 @@ def _infer_service(url: str) -> str | None:
     for seg in segments:
         if seg in _PATH_TO_SERVICE:
             return _PATH_TO_SERVICE[seg]
+    return None
+
+
+def _infer_service_from_key(key: str) -> str | None:
+    """Infer the canonical service name from an MCP server key (config name).
+
+    Fallback for port-based topologies where every server shares the same
+    ``/mcp`` path and the service is encoded only in the config key, e.g.
+    ``gbrain-memory`` / ``gbrain-recall`` / ``gbrain-swarm`` / ``gbrain-task``.
+
+    Args:
+        key: The mcpServers entry name from ``.mcp.json``.
+
+    Returns:
+        ``"memory"`` / ``"recall"`` / ``"swarm"`` / ``"tasks"`` or ``None``
+        when no known service token is present in the key.
+    """
+    for token in re.split(r"[^a-z0-9]+", key.lower()):
+        if token in _PATH_TO_SERVICE:
+            return _PATH_TO_SERVICE[token]
     return None
 
 
@@ -182,7 +203,10 @@ def load_mcp_config(
             url = spec.get("url") or ""
             if not isinstance(url, str) or not url:
                 continue
-            service = _infer_service(url)
+            # Path-based topology (``/memory/mcp``) first; fall back to the
+            # config key (``gbrain-memory``) for port-based topologies where
+            # every server shares the same ``/mcp`` path.
+            service = _infer_service(url) or _infer_service_from_key(key)
             if service is None:
                 # Not a gbrain server (or unknown path) — skip silently; the
                 # doctor only cares about gbrain memory/recall/swarm/tasks.
