@@ -994,3 +994,91 @@ class TestProbeScopeCli:
         )
         assert code == 0
         assert captured["probe_scope"] is None
+
+
+class TestNonClaudeWorkspace:
+    """G1 role-awareness: a non-Claude workspace (only .mcp.json, no
+    settings.json/CLAUDE.md) legitimately omits swarm/task — that is a skip,
+    not a fail. A real Claude agent missing swarm is still a fail."""
+
+    def _cm(self):
+        try:
+            import checks_mcp
+        except Exception:  # pragma: no cover — module may land later
+            pytest.skip("checks_mcp not present")
+        return checks_mcp
+
+    def _ctx(self, tmp_path, services, markers=()):
+        ws = tmp_path / ".claude"
+        ws.mkdir()
+        (ws / ".mcp.json").write_text("{}")
+        for marker in markers:
+            (ws / marker).write_text("x")
+        servers = [
+            McpServer(
+                key=f"gbrain-{s}",
+                service=s,
+                url=f"http://127.0.0.1/{s}",
+                token="tokentokentoken",
+                type="http",
+            )
+            for s in services
+        ]
+
+        class _Ctx:
+            workspace_root = ws
+            _servers = servers
+
+            def server(self, svc):
+                return next(
+                    (s for s in self._servers if s.service == svc), None
+                )
+
+        return _Ctx()
+
+    def test_detects_bot_workspace(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(tmp_path, ["memory", "recall"])
+        assert cm._is_non_claude_workspace(ctx) is True
+
+    def test_settings_json_means_claude_agent(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(tmp_path, ["memory", "recall"], markers=["settings.json"])
+        assert cm._is_non_claude_workspace(ctx) is False
+
+    def test_claude_md_means_claude_agent(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(tmp_path, ["memory", "recall"], markers=["CLAUDE.md"])
+        assert cm._is_non_claude_workspace(ctx) is False
+
+    def test_unresolved_workspace_is_not_bot(self):
+        cm = self._cm()
+
+        class _Ctx:
+            workspace_root = None
+
+            def server(self, svc):
+                return None
+
+        assert cm._is_non_claude_workspace(_Ctx()) is False
+
+    def test_g1_skips_for_bot_missing_swarm(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(tmp_path, ["memory", "recall"])  # no swarm
+        r = cm._c001_config_present(ctx)
+        assert r.status == "skip"
+        assert "non-Claude" in r.message
+
+    def test_g1_fails_for_claude_agent_missing_swarm(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(
+            tmp_path, ["memory", "recall"], markers=["settings.json"]
+        )
+        r = cm._c001_config_present(ctx)
+        assert r.status == "fail"
+
+    def test_g1_fails_when_memory_missing_even_for_bot(self, tmp_path):
+        cm = self._cm()
+        ctx = self._ctx(tmp_path, ["recall"])  # memory + swarm missing
+        r = cm._c001_config_present(ctx)
+        assert r.status == "fail"
