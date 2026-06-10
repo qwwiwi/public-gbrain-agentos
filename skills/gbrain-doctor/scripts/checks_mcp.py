@@ -256,8 +256,33 @@ def _fmt_latency(ms: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_non_claude_workspace(ctx) -> bool:
+    """Whether the resolved workspace is clearly NOT a Claude Code agent.
+
+    A Claude Code agent workspace carries a ``settings.json`` and/or a
+    ``CLAUDE.md``. A non-Claude component (e.g. a Python ingestion bot) keeps
+    only ``.mcp.json`` in its ``.claude/`` purely for MCP auth — it makes
+    direct MCP calls and is not a swarm participant with lifecycle hooks.
+
+    Conservative by design: returns ``True`` only when the workspace is
+    resolved AND *both* markers are absent, so a merely-misconfigured real
+    agent (e.g. a deleted settings.json) is not mistaken for a bot.
+    """
+    ws = getattr(ctx, "workspace_root", None)
+    if ws is None:
+        return False
+    try:
+        return not (ws / "settings.json").exists() and not (ws / "CLAUDE.md").exists()
+    except OSError:  # pragma: no cover — defensive against odd FS errors
+        return False
+
+
 def _c001_config_present(ctx) -> CheckResult:
-    """C001: required MCP servers (memory/recall/swarm) present; tasks optional."""
+    """C001: required MCP servers (memory/recall/swarm) present; tasks optional.
+
+    A non-Claude workspace (:func:`_is_non_claude_workspace`) legitimately omits
+    ``swarm``/``task`` — those are downgraded to ``skip`` rather than failed.
+    """
     name = "G1.mcp_config_servers_present"
     required = ("memory", "recall", "swarm")
     present = {s for s in required if ctx.server(s) is not None}
@@ -266,6 +291,25 @@ def _c001_config_present(ctx) -> CheckResult:
     tasks_note = "tasks present" if has_tasks else "tasks absent (optional)"
 
     if missing:
+        # A non-Claude component (e.g. a Python ingestion bot) legitimately has
+        # only memory+recall — it makes direct MCP calls and is not a swarm
+        # participant. Downgrade to skip when ONLY swarm is missing and the
+        # core read/write pair is present. Missing memory/recall stays a real
+        # fault even for a bot.
+        if (
+            set(missing) == {"swarm"}
+            and {"memory", "recall"}.issubset(present)
+            and _is_non_claude_workspace(ctx)
+        ):
+            return CheckResult(
+                name=name,
+                status="skip",
+                message=redact.redact(
+                    "non-Claude workspace (no settings.json/CLAUDE.md): "
+                    "swarm/task not expected; memory+recall present; "
+                    f"{tasks_note}"
+                ),
+            )
         return CheckResult(
             name=name,
             status="fail",
