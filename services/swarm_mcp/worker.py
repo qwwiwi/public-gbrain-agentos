@@ -164,6 +164,39 @@ def _hmac_outbound_enabled() -> bool:
     return os.environ.get("GBRAIN_HMAC_OUTBOUND_ENABLED", "1") != "0"
 
 
+# Fields surfaced explicitly in the prompt header; every OTHER substantive
+# payload key (question/answers/deliverable/context/subject…) is rendered by
+# _render_payload_content so the agent sees the actual task inline. Fixes the
+# "(no title) + empty body" bug: the prompt used to show only title/body and
+# silently dropped every field a sender put elsewhere, so recipients saw an
+# "empty" task. Internal (_-prefixed) routing keys stay hidden.
+_PROMPT_HIDDEN_KEYS = frozenset({"title", "body", "urgency"})
+# Chat gateways may relay this to a real chat; clamp below the 4096-char limit.
+_PROMPT_MAX = 3800
+
+
+def _render_payload_content(payload: dict) -> str:
+    """Render the substantive payload fields (beyond title/body) as text."""
+    parts: list[str] = []
+    for k, v in payload.items():
+        if k in _PROMPT_HIDDEN_KEYS or k.startswith("_"):
+            continue
+        if v is None or v == "" or (isinstance(v, (list, dict)) and not v):
+            continue
+        rendered = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, indent=2)
+        parts.append(f"{k}: {rendered}")
+    return "\n".join(parts)
+
+
+def _finalize_prompt(text: str, task_id: str) -> str:
+    """Clamp the whole prompt below the chat length limit with a get_delivery
+    hint (reserving the hint's length so it is never truncated)."""
+    if len(text) <= _PROMPT_MAX:
+        return text
+    hint = f"\n… (truncated; full payload: swarm.get_delivery(\"{task_id[:128]}\"))"
+    return text[: _PROMPT_MAX - len(hint)] + hint
+
+
 def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload: dict) -> str:
     """Pack inter-agent payload into a chat-style prompt the agent will see.
 
@@ -183,6 +216,8 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
     extra = ""
     if reason:
         extra = f"\nEscalation reason: {reason}"
+    content = _render_payload_content(payload)
+    content_block = f"\n{content}" if content else ""
 
     # Hard loop gate: COORDINATOR_AGENT is the coordinator; it never needs a
     # dual-report back to itself. Any swarm.notify(coordinator, ...) → ack-only.
@@ -199,10 +234,10 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
             )
         else:
             kind_hint = "smoke ping"
-        return (
+        return _finalize_prompt(
             f"[Inter-agent from {from_agent} -> {to_agent}] urgency={urgency} ({kind_hint})\n"
             f"Task: {title}\n"
-            f"{body}{extra}\n"
+            f"{body}{extra}{content_block}\n"
             f"---\n"
             f"ACTIONS (ack-only fast path, no dual-report):\n"
             f"1. Inspect payload and decide if action is needed. Coordinator targets "
@@ -210,13 +245,14 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
             f"2. If meaningful, send the owner a 1-3 line note via the chat gateway. "
             f"Otherwise skip.\n"
             f"3. DO NOT swarm.notify back (loop risk). Go straight to swarm.ack.\n"
-            f"4. swarm.ack(task_id=\"{task_id}\")."
+            f"4. swarm.ack(task_id=\"{task_id}\").",
+            task_id,
         )
 
-    return (
+    return _finalize_prompt(
         f"[Inter-agent from {from_agent} -> {to_agent}] urgency={urgency}\n"
         f"Task: {title}\n"
-        f"{body}{extra}\n"
+        f"{body}{extra}{content_block}\n"
         f"---\n"
         f"ACTIONS:\n"
         f"1. Execute the task.\n"
@@ -244,7 +280,8 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
         f"\"_origin_task\": \"{task_id}\"}})\n"
         f"   Without this step the coordinator cannot see your work or schedule "
         f"follow-ups. Chat report = owner, swarm.notify = coordinator. Two recipients.\n"
-        f"4. Call swarm.ack(task_id=\"{task_id}\") at the very end."
+        f"4. Call swarm.ack(task_id=\"{task_id}\") at the very end.",
+        task_id,
     )
 
 

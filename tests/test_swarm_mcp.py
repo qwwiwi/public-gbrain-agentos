@@ -23,7 +23,32 @@ from services.swarm_mcp.outbox import (
     make_task_id,
 )
 from services.swarm_mcp.server import _REQUEST_AUTH
-from services.swarm_mcp.worker import _format_virtual_prompt, _load_gateways
+from services.swarm_mcp.worker import (
+    _format_virtual_prompt,
+    _load_gateways,
+    _render_payload_content,
+)
+
+
+def test_payload_content_rendered_inline():
+    # The "(no title) + empty body" fix: content in non-title/body fields must
+    # show inline, not be dropped.
+    payload = {"type": "context_request", "question": "what breaks?",
+               "deliverable": "a short answer", "_origin_task": "x::y"}
+    prompt = _format_virtual_prompt("alice", "bob", "t::1", payload)
+    assert "what breaks?" in prompt and "a short answer" in prompt
+    assert "_origin_task" not in prompt  # internal keys stay hidden
+
+
+def test_render_skips_title_body_and_empty():
+    out = _render_payload_content({"title": "T", "body": "B", "q": "x", "e": ""})
+    assert out == "q: x"
+
+
+def test_long_prompt_clamped_with_hint():
+    prompt = _format_virtual_prompt("a", "b", "t::big", {"big": "word " * 1500})
+    assert len(prompt) <= 4096
+    assert "get_delivery" in prompt
 
 
 # --- Tool-gating helpers -----------------------------------------------------
