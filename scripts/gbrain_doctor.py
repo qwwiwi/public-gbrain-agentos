@@ -663,7 +663,7 @@ async def check_embedding_queue_depth(conn: asyncpg.Connection) -> CheckResult:
     """Warn-only: count pending embedding_jobs rows."""
     try:
         depth = await conn.fetchval(
-            "SELECT count(*) FROM embedding_jobs WHERE processed_at IS NULL"
+            "SELECT count(*) FROM embedding_jobs WHERE status = 'pending'"
         )
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
