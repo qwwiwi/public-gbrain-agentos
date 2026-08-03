@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import io
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -408,6 +409,44 @@ async def test_check_embedding_queue_huge_fail():
     conn.fetchval = AsyncMock(return_value=5000)
     res = await doc.check_embedding_queue_depth(conn)
     assert res.status == "fail"
+
+
+@pytest.mark.asyncio
+async def test_check_embedding_queue_filters_on_existing_column():
+    """The queue query must only reference columns embedding_jobs actually has.
+
+    The mocked-conn tests above pass whatever column the query names, so a
+    typo'd or renamed column degrades the check to `warn: query failed`
+    against a real database while the suite stays green. This asserts the
+    filter column against the shipped schema instead.
+    """
+    captured: dict[str, str] = {}
+
+    async def fake_fetchval(sql: str, *args: object) -> int:
+        captured["sql"] = sql
+        return 0
+
+    conn = MagicMock()
+    conn.fetchval = fake_fetchval
+
+    res = await doc.check_embedding_queue_depth(conn)
+    assert res.status == "pass"
+
+    schema = (
+        _REPO_ROOT / "migrations" / "001_initial_schema.sql"
+    ).read_text(encoding="utf-8")
+    body = re.search(
+        r"CREATE TABLE IF NOT EXISTS embedding_jobs \((.*?)\n\);",
+        schema,
+        re.DOTALL,
+    )
+    assert body is not None, "embedding_jobs table not found in schema"
+    columns = set(re.findall(r"^\s+(\w+)\s", body.group(1), re.MULTILINE))
+
+    referenced = set(re.findall(r"\bWHERE\s+(\w+)", captured["sql"]))
+    assert referenced, "queue query has no WHERE clause to check"
+    unknown = referenced - columns
+    assert not unknown, f"query references non-existent column(s): {unknown}"
 
 
 # ---------------------------------------------------------------------------
