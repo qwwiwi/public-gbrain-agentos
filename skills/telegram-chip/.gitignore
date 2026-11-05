@@ -4,3 +4,5 @@
 __pycache__/
 venv/
 exports/
+media-cache/
+outbox/

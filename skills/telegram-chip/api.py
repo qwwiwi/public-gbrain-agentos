@@ -11,11 +11,13 @@ import httpx
 from contextlib import asynccontextmanager
 from typing import Optional, List, Union
 
+import json
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
 from telethon import events
 from pydantic import BaseModel, Field
 
-from telegram_core import telegram
+from telegram_core import telegram, MediaFetchError, FolderError, SendRefusedError, log_and_format_error
 
 SALES_WEBHOOK_URL = os.getenv("SALES_WEBHOOK_URL", "")
 SALES_MONITORED_USERS = os.getenv("SALES_MONITORED_USERS", "")
@@ -89,6 +91,16 @@ class CreateGroupRequest(BaseModel):
     users: List[Union[int, str]]
 
 
+class CreateSupergroupRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=128)
+    about: Optional[str] = Field(None, max_length=255)
+    users: List[Union[int, str]] = Field(default_factory=list)
+
+
+class HistoryVisibleRequest(BaseModel):
+    visible: bool = True
+
+
 class InviteToGroupRequest(BaseModel):
     chat_id: Union[int, str]
     user_ids: List[Union[int, str]]
@@ -110,6 +122,14 @@ class SaveDraftRequest(BaseModel):
     chat_id: Union[int, str]
     message: str
     reply_to: Optional[int] = None
+
+
+class FolderUpsertRequest(BaseModel):
+    title: str
+    color: Optional[int] = Field(None, ge=0, le=6)
+    emoticon: Optional[str] = None
+    include_chat_ids: List[Union[int, str]] = Field(default_factory=list)
+    mode: str = Field("replace", pattern="^(replace|add|remove)$")
 
 
 class ApiResponse(BaseModel):
@@ -166,6 +186,12 @@ def make_response(result: str) -> ApiResponse:
     return ApiResponse(success=True, data=result)
 
 
+@app.exception_handler(SendRefusedError)
+async def send_refused_handler(_request, exc: SendRefusedError):
+    """Never-write-first refusal: HTTP 403 in the legacy ApiResponse shape."""
+    return JSONResponse(status_code=403, content={"success": False, "data": None, "error": exc.message})
+
+
 # ==================== Health Check ====================
 
 @app.get("/health")
@@ -195,6 +221,37 @@ async def list_chats(
         limit=limit, chat_type=chat_type, archived=archived, unread_only=unread_only
     )
     return make_response(result)
+
+
+@app.get("/folders", response_model=ApiResponse)
+async def list_folders(include_chats: bool = Query(True)):
+    """List Telegram folders (dialog filters) with optional chats inside each."""
+    result = await telegram.list_folders(include_chats=include_chats)
+    return make_response(result)
+
+
+@app.post("/folders/upsert", response_model=ApiResponse)
+async def upsert_folder(request: FolderUpsertRequest):
+    """Create/update ONE folder by exact title and set its chats (mode replace|add|remove).
+
+    Other folders are never touched; there is no delete. color/emoticon change only when sent
+    (color null clears it). Errors: 422 validation / >200 chats / unresolved ids / empty result,
+    409 shared chatlist or no free id, 429 FloodWait, 502 upstream.
+    """
+    sent = request.model_fields_set if hasattr(request, "model_fields_set") else request.__fields_set__
+    try:
+        result = await telegram.upsert_folder(
+            title=request.title,
+            include_chat_ids=request.include_chat_ids,
+            mode=request.mode,
+            color=request.color,
+            set_color="color" in sent,
+            emoticon=request.emoticon,
+            set_emoticon="emoticon" in sent,
+        )
+    except FolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    return ApiResponse(success=True, data=json.dumps(result, ensure_ascii=False))
 
 
 @app.get("/chats/{chat_id}", response_model=ApiResponse)
@@ -326,17 +383,58 @@ async def search_messages(request: SearchMessagesRequest):
 
 @app.get("/chats/{chat_id}/messages/{message_id}/media", response_model=ApiResponse)
 async def download_media(
-    chat_id: str, 
+    chat_id: str,
     message_id: int,
-    output_path: Optional[str] = Query(None, description="Path to save the media file. Default: $TELEGRAM_CHIP_MEDIA_DIR or /tmp/telegram-chip-media/.")
+    output_path: Optional[str] = Query(None, description="Legacy: explicit save path (trailing '/' = save inside dir). Default: media-cache/<chat>/<msg>.<ext> inside the skill dir (chmod 600)"),
+    transcribe: bool = Query(False, description="Also transcribe voice/video-note/audio/video via Groq Whisper (cached). Implies v=2"),
+    v: int = Query(1, ge=1, le=2, description="1 = legacy contract (HTTP 200, errors as {success:false,error} in data); 2 = HTTP status codes"),
 ):
-    """Download media from a message."""
+    """Download media from a message.
+
+    v=1 (default, legacy): always HTTP 200; data = JSON string
+      {success: true, path, file_name, mime_type, size, kind, duration, cached} or {success: false, error}.
+    v=2 / transcribe=1: same success payload (+ transcript, transcript_cached), errors as HTTP codes:
+      404 no message/media, 413 over size cap, 422 not downloadable/transcribable,
+      429 Telegram FloodWait, 503 transcription key missing, 502 upstream failure, 504 timeout.
+    """
     try:
         parsed_id = int(chat_id)
     except ValueError:
         parsed_id = chat_id
-    result = await telegram.download_media(parsed_id, message_id, output_path=output_path)
-    return make_response(result)
+    if not transcribe and v == 1:
+        return make_response(await telegram.download_media(parsed_id, message_id, output_path=output_path))
+    if transcribe and output_path:
+        raise HTTPException(status_code=400, detail="output_path is not supported with transcribe=1")
+    try:
+        if transcribe:
+            result = await telegram.transcribe_media(parsed_id, message_id)
+        else:
+            result = await telegram.fetch_media(parsed_id, message_id, output_path=output_path)
+    except MediaFetchError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=log_and_format_error("download_media", e, chat_id=chat_id, message_id=message_id))
+    return ApiResponse(success=True, data=json.dumps(result, ensure_ascii=False))
+
+
+@app.get("/chats/{chat_id}/messages/{message_id}/media/file")
+async def download_media_file(chat_id: str, message_id: int):
+    """Stream the (cached) media file bytes – for agents not on the chip host. HTTP codes as v=2."""
+    try:
+        parsed_id = int(chat_id)
+    except ValueError:
+        parsed_id = chat_id
+    try:
+        result = await telegram.fetch_media(parsed_id, message_id)
+    except MediaFetchError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=log_and_format_error("download_media_file", e, chat_id=chat_id, message_id=message_id))
+    return FileResponse(
+        result["path"],
+        media_type=result.get("mime_type") or "application/octet-stream",
+        filename=result.get("file_name") or None,
+    )
 
 
 # ==================== Contact Endpoints ====================
@@ -410,6 +508,31 @@ async def resolve_username(username: str):
 async def create_group(request: CreateGroupRequest):
     """Create a new group chat."""
     result = await telegram.create_group(title=request.title, users=request.users)
+    return make_response(result)
+
+
+@app.post("/supergroups", response_model=ApiResponse)
+async def create_supergroup(request: CreateSupergroupRequest):
+    """Create a supergroup (megagroup), invite users, make history visible to new members.
+
+    data = JSON: created, chat_id (marked -100…), title, invites[{user, status, error?}], history.
+    One create attempt only: do NOT retry when success=true, even if some invites failed.
+    """
+    result = await telegram.create_supergroup(
+        title=request.title, about=request.about, users=request.users
+    )
+    return make_response(result)
+
+
+@app.post("/chats/{chat_id}/history-visible", response_model=ApiResponse)
+async def set_history_visible(chat_id: str, request: Optional[HistoryVisibleRequest] = None):
+    """Show (visible=true, default) or hide chat history for new members. Supergroups/channels only."""
+    try:
+        parsed_id = int(chat_id)
+    except ValueError:
+        parsed_id = chat_id
+    visible = request.visible if request is not None else True
+    result = await telegram.set_history_visible(parsed_id, visible=visible)
     return make_response(result)
 
 
@@ -597,4 +720,4 @@ async def tgdl_export(chat_id: str, limit: int = 500, out_path: Optional[str] = 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=8080)
