@@ -86,7 +86,7 @@
 ### Точки входа и их защита
 
 1. **HTTP API через Python клиент** (`telegram_client.py`)
-   - Used by caller scripts that import `telegram_client.py`
+   - Используется скриптами в your own scripts
    - Защита: автоматические задержки, проверка лимитов, обработка ошибок
 
 2. **HTTP API сервер** (`telegram_core.py`)
@@ -185,7 +185,7 @@ except TelegramClientError as e:
 
 ## Обновление скриптов
 
-Caller scripts that hit telegram-chip endpoints should:
+Все скрипты в your own scripts должны:
 1. Импортировать `RateLimitError` и `FloodWaitError`: `from telegram_client import ..., RateLimitError, FloodWaitError`
 2. Обрабатывать обе ошибки (можно вместе, так как у них одинаковый интерфейс)
 
