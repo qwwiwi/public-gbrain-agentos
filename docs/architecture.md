@@ -285,11 +285,11 @@ The `skills/` folder is a vendored set of optional ingestion skills your agents 
 
 | Skill | Triggers on | What it does |
 |---|---|---|
-| `transcript/` | YouTube URLs | Fetches transcript via TranscriptAPI |
+| `transcript/` | YouTube URLs | Fetches transcript via Loore (`yt_transcript`) |
 | `markdown-new/` | Generic web URLs | Clean markdown extraction via readability |
 | `groq-voice/` | Audio attachments | Whisper transcription via Groq |
 | `twitter/` | x.com / twitter.com URLs | Thread reading via SocialData |
-| `instagram-superpower/` | instagram.com URLs | Caption + metadata via HikerAPI |
+| `instagram-superpower/` | instagram.com URLs | Instagram analytics via Loore |
 | `perplexity-research/` | Explicit `/research` command | Sonar web research |
 | `agent-browser/` | Explicit invocation | Headless Chrome via CDP for sites the others miss |
 | `mcp-builder/` | Explicit invocation | Helper for building new MCP servers |

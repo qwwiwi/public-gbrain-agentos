@@ -227,8 +227,7 @@ Before you start deploying, collect every piece of information you cannot derive
 
 7. **Which optional skills to enable**
    - Groq (Whisper transcription of voice notes) — needs `GROQ_API_KEY`
-   - HikerAPI (Instagram caption extraction) — needs `HIKERAPI_KEY`
-   - TranscriptAPI (YouTube transcripts) — needs `TRANSCRIPTAPI_KEY`
+   - Loore (Instagram analytics + YouTube transcripts; REST/CLI/MCP, https://loore.ai) — needs `LOORE_API_KEY`
    - SocialData (X/Twitter threads) — needs `SOCIALDATA_KEY`
    - Perplexity (web research) — needs `PERPLEXITY_API_KEY`
    - All are optional. Default: ask per skill, install only the ones they want.

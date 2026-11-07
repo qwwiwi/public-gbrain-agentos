@@ -427,7 +427,7 @@ Memory tool — сессионная, теряется при `/clear` или re
 Да, любой MCP-совместимый клиент может ходить в `memory_mcp` / `recall_mcp` / `swarm_mcp` / `task_mcp`. Для non-MCP клиентов есть HTTP JSON-RPC endpoint.
 
 **Сколько стоит держать?**
-VPS Hetzner CPX42 ~16€/мес. Telegram-бот бесплатный. Опциональные API (Groq Whisper, HikerAPI, Perplexity) — по своим тарифам, и нужны только если включишь соответствующий ingestion skill.
+VPS Hetzner CPX42 ~16€/мес. Telegram-бот бесплатный. Опциональные API (Groq Whisper, Loore, Perplexity) — по своим тарифам, и нужны только если включишь соответствующий ingestion skill.
 
 **Я могу форкать и менять под себя?**
 Apache 2.0 license. Форкай, меняй, переделывай. Если найдёшь баг или сделаешь полезный feature — PR в upstream приветствуется.
@@ -519,8 +519,7 @@ public-gbrain-agentos/
 
 **Опциональные API-ключи** (только если включишь соответствующий ingestion skill):
 - Groq — Whisper-транскрипция голосовых
-- HikerAPI — Instagram captions
-- TranscriptAPI — YouTube транскрипты
+- [Loore](https://loore.ai) — Instagram аналитика и YouTube транскрипты (REST, CLI, MCP; [docs](https://docs.loore.ai))
 - SocialData — X/Twitter
 - Perplexity — web research
 

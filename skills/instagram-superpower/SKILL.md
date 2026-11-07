@@ -1,7 +1,7 @@
 ---
 name: instagram-superpower
 description: >
-  Instagram analytics via HikerAPI: top reels per account, watchlist of accounts
+  Instagram analytics via Loore: top reels per account, watchlist of accounts
   to scan periodically, engagement scoring. Use when: (1) you need to analyze
   an Instagram account (followers, posts, top reels), (2) build a watchlist of
   competitors, (3) find the most-engaging reels of an account over a window of
@@ -13,8 +13,8 @@ description: >
 
 # instagram-superpower
 
-Analytics for Instagram accounts using [HikerAPI](https://hikerapi.com) SaaS
-(public API, paid per request).
+Analytics for Instagram accounts using [Loore](https://loore.ai) (REST API, CLI and
+MCP server; paid per call). Docs: [docs.loore.ai](https://docs.loore.ai).
 
 The **download** half of this skill (media files from Instagram CDN via a
 self-hosted Cobalt instance) was tightly coupled to a private VPS layout in
@@ -25,10 +25,15 @@ wire its URL into your own script.
 ## Setup
 
 ```sh
-mkdir -p ~/.secrets/hikerapi
-echo "<YOUR_HIKERAPI_KEY>" > ~/.secrets/hikerapi/api-key
-chmod 600 ~/.secrets/hikerapi/api-key
+export LOORE_API_KEY=<your-key>
+# or keep it in a file (read by analyze.sh when the env var is unset):
+mkdir -p ~/.secrets/loore
+echo "<YOUR_LOORE_API_KEY>" > ~/.secrets/loore/api-key
+chmod 600 ~/.secrets/loore/api-key
 ```
+
+Get a key at [loore.ai](https://loore.ai) (Settings → API and MCP). One key works for REST
+and MCP (`https://mcp.loore.ai/mcp`).
 
 ## Usage
 
@@ -55,10 +60,23 @@ bash scripts/watchlist.sh scan [top_N] [days]
 `scan` walks every account in `~/.secrets/cobalt/watchlist.json` and calls
 `analyze.sh` on each with a 10-second pause between requests.
 
-## API key & balance
+## API calls & balance
 
-Each request costs ~$0.001. Check balance at the end of `analyze.sh` output
-or via `curl -H "x-access-key: $KEY" https://api.instagrapi.com/sys/balance`.
+`analyze.sh` calls the Loore REST API: `POST https://mcp.loore.ai/v1/<method>` with
+`Authorization: Bearer $LOORE_API_KEY` (methods `ig-profile`, `ig-user-reels`; the same
+tools are available over MCP as `ig_profile`, `ig_user_reels`). Other `ig_*` tools cover
+posts, comments, stories and more; `analyze_reel` returns a reel transcript.
+
+```sh
+curl -X POST https://mcp.loore.ai/v1/ig-profile \
+  -H "Authorization: Bearer $LOORE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"@someuser"}'
+```
+
+Paid calls may return HTTP 428 with `spend_authorization`: approve the spend, then retry
+with the returned authorization id. The credit balance is printed at the end of
+`analyze.sh` output (`billing-balance` is a free call).
 
 ## Omitted scripts
 

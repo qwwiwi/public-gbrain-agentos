@@ -1,108 +1,125 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Instagram SuperPower -- Analyze Account via HikerAPI
+# Instagram SuperPower -- Analyze Account via Loore REST (https://loore.ai)
 # Usage: bash analyze.sh <username> [top_N] [days]
 # Example: bash analyze.sh garyvee 5 14
+# Key: LOORE_API_KEY env var, or ~/.secrets/loore/api-key
 
 USERNAME="${1:?Usage: analyze.sh <username> [top_N] [days]}"
 TOP_N="${2:-5}"
 DAYS="${3:-14}"
 
-HIKER_KEY_FILE="$HOME/.secrets/hikerapi/api-key"
+LOORE_KEY_FILE="$HOME/.secrets/loore/api-key"
 
-if [ ! -f "$HIKER_KEY_FILE" ]; then
-    echo "ERROR: HikerAPI key not found at $HIKER_KEY_FILE"
-    exit 1
+if [ -z "${LOORE_API_KEY:-}" ]; then
+    if [ ! -f "$LOORE_KEY_FILE" ]; then
+        echo "ERROR: LOORE_API_KEY is not set and no key file at $LOORE_KEY_FILE"
+        exit 1
+    fi
+    LOORE_API_KEY=$(cat "$LOORE_KEY_FILE")
 fi
-
-HIKER_KEY=$(cat "$HIKER_KEY_FILE")
+export LOORE_API_KEY
+export LOORE_API_BASE="${LOORE_API_BASE:-https://mcp.loore.ai/v1}"
 
 echo "Analyzing @${USERNAME} -- top ${TOP_N} reels, last ${DAYS} days..."
 echo ""
 
-python3 << PYEOF
-import json, sys, urllib.request
+python3 - "$USERNAME" "$TOP_N" "$DAYS" << 'PYEOF'
+import json, os, sys, urllib.error, urllib.request
 from datetime import datetime, timezone, timedelta
 
-username = "${USERNAME}"
-top_n = ${TOP_N}
-days = ${DAYS}
-hiker_key = "${HIKER_KEY}"
-base = "https://api.instagrapi.com"
+username = sys.argv[1]
+top_n = int(sys.argv[2])
+days = int(sys.argv[3])
+loore_key = os.environ["LOORE_API_KEY"]
+base = os.environ["LOORE_API_BASE"].rstrip("/")
 
-def api_get(endpoint, params={}):
-    params_str = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{base}{endpoint}?{params_str}" if params_str else f"{base}{endpoint}"
-    req = urllib.request.Request(url, headers={
-        "accept": "application/json",
-        "x-access-key": hiker_key,
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+def api_post(method, body=None):
+    """POST https://mcp.loore.ai/v1/<method>; returns the `result` of the envelope."""
+    req = urllib.request.Request(
+        f"{base}/{method}",
+        data=json.dumps(body or {}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {loore_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            envelope = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code == 428:
+            # Paid call needs spend authorization: approve it in Loore, then retry
+            # with spend_authorization_id in the request body.
+            raise RuntimeError(f"HTTP 428 spend authorization required: {detail}")
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    if envelope.get("status") != "ok":
+        raise RuntimeError(f"Loore error: {envelope.get('error', envelope)}")
+    return envelope.get("result", {})
+
+def parse_ts(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 # 1. Profile
 print(f"Looking up @{username}...")
 try:
-    profile = api_get("/v2/user/by/username", {"username": username})
-    user = profile.get("user", profile)
-    user_id = user.get("pk") or user.get("id")
+    user = api_post("ig-profile", {"username": username}).get("profile", {})
+    user_id = user.get("id")
     print(f"Account: @{user.get('username', username)}")
-    print(f"Full name: {user.get('full_name', '?')}")
-    print(f"Followers: {user.get('follower_count', '?'):,}")
-    print(f"Following: {user.get('following_count', '?'):,}")
-    print(f"Posts: {user.get('media_count', '?'):,}")
-    print(f"Verified: {user.get('is_verified', '?')}")
+    print(f"Full name: {user.get('fullName', '?')}")
+    print(f"Followers: {user.get('followers', 0):,}")
+    print(f"Following: {user.get('following', 0):,}")
+    print(f"Posts: {user.get('posts', 0):,}")
+    print(f"Verified: {user.get('isVerified', '?')}")
     print(f"Category: {user.get('category', '?')}")
-    print(f"Bio: {user.get('biography', '')[:100]}")
+    print(f"Bio: {(user.get('biography') or '')[:100]}")
     print()
 except Exception as e:
     print(f"Profile lookup failed: {e}")
     sys.exit(1)
 
-# 2. Clips
-print(f"Fetching reels...")
+# 2. Reels
+print("Fetching reels...")
 cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 all_reels = []
-page_id = None
+cursor = None
 
-for page in range(5):  # max 5 pages (~60 reels)
-    params = {"user_id": str(user_id)}
-    if page_id:
-        params["page_id"] = page_id
-    
+for page in range(5):  # max 5 pages (~250 reels)
+    body = {"limit": 50}
+    if user_id:
+        body["user_id"] = str(user_id)
+    else:
+        body["username"] = username
+    if cursor:
+        body["cursor"] = cursor
+
     try:
-        data = api_get("/v2/user/clips", params)
+        data = api_post("ig-user-reels", body)
     except Exception as e:
-        print(f"Clips fetch error: {e}")
+        print(f"Reels fetch error: {e}")
         break
-    
-    items = data.get("response", {}).get("items", [])
+
+    items = data.get("items", [])
     if not items:
         break
-    
-    oldest_in_page = None
+
     for item in items:
-        media = item.get("media", {})
-        taken_at = media.get("taken_at", 0)
-        taken_dt = datetime.fromtimestamp(taken_at, tz=timezone.utc)
-        oldest_in_page = taken_dt
-        
-        if taken_dt < cutoff:
+        taken_dt = parse_ts(item["takenAt"]) if item.get("takenAt") else None
+        if taken_dt is None or taken_dt < cutoff:
             continue
-        
-        code = media.get("code", "")
-        views = media.get("play_count", 0) or media.get("view_count", 0) or 0
-        likes = media.get("like_count", 0) or 0
-        comments = media.get("comment_count", 0) or 0
-        caption = ""
-        cap = media.get("caption")
-        if isinstance(cap, dict):
-            caption = cap.get("text", "")[:200]
-        
+
+        views = item.get("views") or 0
+        likes = item.get("likes") or 0  # absent when the author hid likes
+        comments = item.get("comments") or 0
+        caption = (item.get("caption") or "")[:200]
+
         all_reels.append({
-            "code": code,
-            "url": f"https://www.instagram.com/reel/{code}/",
+            "code": item.get("code", ""),
+            "url": item.get("url", ""),
             "date": taken_dt.strftime("%Y-%m-%d"),
             "views": views,
             "likes": likes,
@@ -110,11 +127,12 @@ for page in range(5):  # max 5 pages (~60 reels)
             "caption": caption.replace("\n", " "),
             "engagement": views + likes * 10,
         })
-    
-    page_id = data.get("next_page_id")
-    if not page_id:
+
+    cursor = data.get("nextCursor")
+    if not data.get("hasMore") or not cursor:
         break
-    if oldest_in_page and oldest_in_page < cutoff:
+    last = items[-1].get("takenAt")
+    if last and parse_ts(last) < cutoff:
         break
 
 # 3. Sort and display
@@ -139,11 +157,11 @@ print("\n" + "=" * 70)
 print("JSON:")
 print(json.dumps(top, ensure_ascii=False, indent=2))
 
-# 4. Balance
+# 4. Balance (free call)
 try:
-    balance = api_get("/sys/balance")
-    print(f"\nHikerAPI balance: \${balance['amount']:.2f} ({balance['requests']:,} requests left)")
-except:
+    balance = api_post("billing-balance")
+    print(f"\nLoore credits left: {balance['creditsRemaining']:,}")
+except Exception:
     pass
 PYEOF
 

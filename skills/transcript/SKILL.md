@@ -1,114 +1,73 @@
 ---
 name: transcript
 description: >
-  Транскрипт YouTube роликов через TranscriptAPI.com. ОБЯЗАТЕЛЬНО используй этот скилл когда:
+  Транскрипт YouTube роликов через Loore (yt_transcript). ОБЯЗАТЕЛЬНО используй этот скилл когда:
   (1) пользователь присылает YouTube ссылку (youtube.com, youtu.be),
   (2) просит рассказать о чём видео, (3) просит транскрипт/субтитры,
   (4) говорит «что в этом видео», «о чём ролик», «перескажи видео»,
   (5) любой запрос связанный с содержимым YouTube видео.
   Триггеры: YouTube ссылка, «транскрипт», «о чём видео», «что говорят в видео»,
   «перескажи ролик», «summarize video», «get transcript».
-  НЕ использовать yt-dlp или youtube-transcript-api -- только этот скилл.
-homepage: https://transcriptapi.com
+  Данные YouTube -- только через Loore или официальный YouTube Data API v3.
+  yt-dlp и скрейпинг со своего IP -- только для скачивания видеофайлов.
+homepage: https://loore.ai
 user-invocable: true
 ---
 
 # Transcript
 
-Fetch video transcripts via [TranscriptAPI.com](https://transcriptapi.com).
+Fetch YouTube video transcripts via [Loore](https://loore.ai) (REST, CLI and MCP server).
+Docs: [docs.loore.ai](https://docs.loore.ai).
+
+**YouTube rule:** YouTube data (transcripts, metadata, comments, search) comes only from
+Loore (`yt_*` tools) or the official YouTube Data API v3. `yt-dlp` or scraping from your own
+IP is allowed only for downloading video files, never for data.
 
 ## Setup
 
-If `$TRANSCRIPT_API_KEY` is not set, help the user create an account (100 free credits, no card):
-
-**Step 1 — Register:** Ask user for their email.
-
-```bash
-node ./scripts/tapi-auth.js register --email USER_EMAIL
-```
-
-→ OTP sent to email. Ask user: _"Check your email for a 6-digit verification code."_
-
-**Step 2 — Verify:** Once user provides the OTP:
+Create an API key in the Loore dashboard (Settings → API and MCP) at [loore.ai](https://loore.ai)
+and export it:
 
 ```bash
-node ./scripts/tapi-auth.js verify --token TOKEN_FROM_STEP_1 --otp CODE
+export LOORE_API_KEY=<your-key>
 ```
 
-> API key saved to `~/.claude-lab/your-agent/secrets/transcript-api-key`. See **File Writes** below for details. Existing file is backed up before modification.
+One key works for both REST and MCP. MCP endpoint: `https://mcp.loore.ai/mcp`.
 
-Manual option: [transcriptapi.com/signup](https://transcriptapi.com/signup) → Dashboard → API Keys.
-
-## File Writes
-
-The verify and save-key commands save the API key to `~/.claude-lab/your-agent/secrets/transcript-api-key` (plain text file containing only the key). **Existing file is backed up to `~/.claude-lab/your-agent/secrets/transcript-api-key.bak` before modification.**
-
-To use the API key in terminal/CLI outside the agent, add to your shell profile manually:
-`export TRANSCRIPT_API_KEY=<your-key>`
-
-## GET /api/v2/youtube/transcript
+## POST https://mcp.loore.ai/v1/yt-transcript
 
 ```bash
-curl -s "https://transcriptapi.com/api/v2/youtube/transcript\
-?video_url=VIDEO_URL&format=text&include_timestamp=true&send_metadata=true" \
-  -H "Authorization: Bearer $TRANSCRIPT_API_KEY"
+curl -s -X POST https://mcp.loore.ai/v1/yt-transcript \
+  -H "Authorization: Bearer $LOORE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "VIDEO_URL", "include_timestamps": true}'
 ```
 
-| Param               | Required | Default | Values                          |
-| ------------------- | -------- | ------- | ------------------------------- |
-| `video_url`         | yes      | —       | YouTube URL or 11-char video ID |
-| `format`            | no       | `json`  | `json`, `text`                  |
-| `include_timestamp` | no       | `true`  | `true`, `false`                 |
-| `send_metadata`     | no       | `false` | `true`, `false`                 |
+| Param                | Required | Default | Values                                          |
+| -------------------- | -------- | ------- | ----------------------------------------------- |
+| `url`                | yes      | —       | YouTube video or Shorts URL, or 11-char video ID |
+| `language`           | no       | —       | Caption language, e.g. `ru`, `en`, `en-US`      |
+| `original_audio`     | no       | `false` | `true` = only the original spoken language      |
+| `include_timestamps` | no       | `false` | `true` = timed segments instead of plain text   |
 
-Accepts: full URLs (`youtube.com/watch?v=ID`), short URLs (`youtu.be/ID`), shorts (`youtube.com/shorts/ID`), or bare video IDs.
+The answer comes in one envelope: `{ "status": "ok", "result": { ... } }`. Errors use the same
+envelope: `{ "status": "error", "error": "...", "details": { } }`. Long transcripts are paged
+(up to 40000 characters per answer); continue with the cursor/offset from the answer.
 
-**Default:** Always use `format=text&include_timestamp=true&send_metadata=true` unless user specifies otherwise.
-
-**Response** (`format=json`):
-
-```json
-{
-  "video_id": "dQw4w9WgXcQ",
-  "language": "en",
-  "transcript": [
-    { "text": "We're no strangers to love", "start": 18.0, "duration": 3.5 },
-    { "text": "You know the rules and so do I", "start": 21.5, "duration": 2.8 }
-  ],
-  "metadata": {
-    "title": "Rick Astley - Never Gonna Give You Up",
-    "author_name": "Rick Astley",
-    "author_url": "https://www.youtube.com/@RickAstley",
-    "thumbnail_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"
-  }
-}
-```
-
-**Response** (`format=text`):
-
-```json
-{
-  "video_id": "dQw4w9WgXcQ",
-  "language": "en",
-  "transcript": "[00:00:18] We're no strangers to love\n[00:00:21] You know the rules...",
-  "metadata": {...}
-}
-```
+Related `yt_*` tools: `yt_search`, `yt_channel`, `yt_channel_videos`, `yt_video`
+(lists available `captionLanguages`), `yt_comments`.
 
 ## Errors
 
-| Code | Meaning       | Action                              |
-| ---- | ------------- | ----------------------------------- |
-| 401  | Bad API key   | Check key or re-setup               |
-| 402  | No credits    | Top up at transcriptapi.com/billing |
-| 404  | No transcript | Video may not have captions enabled |
-| 408  | Timeout       | Retry once after 2s                 |
-| 429  | Rate limited  | Wait and retry                      |
+| Code | Meaning                  | Action                                                           |
+| ---- | ------------------------ | ---------------------------------------------------------------- |
+| 401  | Bad API key              | Check `LOORE_API_KEY`                                            |
+| 428  | Spend authorization      | Paid call: approve the spend (`spend_authorization`), then retry |
+| 429  | Rate limited             | Wait and retry                                                   |
 
 ## Tips
 
 - For long videos, summarize key points first, offer full transcript on request.
-- Use `format=json` when you need precise timestamps for quoting specific moments.
-- Use `include_timestamp=false` for clean text suitable for translation or analysis.
-- 1 credit per successful request. Errors don't cost credits.
-- Free tier: 100 credits, 300 req/min.
+- Use `include_timestamps: true` when you need precise timestamps for quoting specific moments.
+- Use plain text (default) for clean text suitable for translation or analysis.
+- Check available caption languages with `yt_video` before asking for a specific `language`.
