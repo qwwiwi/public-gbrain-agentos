@@ -28,12 +28,12 @@ it when the description matches.
 | `agent-browser` | Browser automation CLI (Chrome/Chromium via CDP). Navigate, click, fill forms, screenshot. | `agent-browser` npm/cargo/brew binary |
 | `markdown-new` | Clean Markdown extraction from any URL via `markdown.new`. Drop-in replacement for noisy `web_fetch`. | none |
 | `groq-voice` | Transcribe voice messages (`.ogg`) via Groq Whisper. | `GROQ_API_KEY` |
-| `transcript` | YouTube transcripts via TranscriptAPI.com. | `TRANSCRIPT_API_KEY` (free tier, 100 credits) |
+| `transcript` | YouTube transcripts via Loore (`yt_transcript`). | `LOORE_API_KEY` (https://loore.ai) |
 | `twitter` | Read tweets, threads, profiles, articles via FxTwitter (free) + SocialData (paid fallback). | `SOCIALDATA_API_KEY` for non-free endpoints |
 | `perplexity-research` | Web research with citations via Perplexity Sonar. | `PERPLEXITY_API_KEY` |
 | `mcp-builder` | Anthropic-authored skill that helps you build new MCP servers from scratch. | none |
 | `telegram-chip` | Telegram **user-account** (MTProto/Telethon) wrapper, exposes a local HTTP API. | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, interactive login. **Use only if you actually need a user account**, not for bots. |
-| `instagram-superpower` | Instagram analytics via HikerAPI (top reels, watchlist). Media-download half was private; only the analytics scripts ship. | `HikerAPI` key. |
+| `instagram-superpower` | Instagram analytics via Loore (top reels, watchlist). Media-download half was private; only the analytics scripts ship. | `LOORE_API_KEY` (https://loore.ai). |
 
 ## What was removed during sanitization
 
