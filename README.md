@@ -288,6 +288,32 @@ gbrain — это **MCP-сервер**, не закрытая платформа
 
 Что доступно сразу: `mcp__gbrain-memory__create_*_note`, `mcp__gbrain-recall__{recall,get,recent,related,stats}`, `mcp__gbrain-swarm__{notify,list_my_pending,ack,...}`, `mcp__gbrain-tasks__{task_*,agent_*}`.
 
+#### Подключение ко всем каталогам сразу (user-scope)
+
+`.mcp.json` действует только в своём workspace'е. Если агент работает не в одном
+каталоге, серверы можно зарегистрировать на user-scope — в `~/.claude.json`:
+
+```bash
+# локальная установка (сервисы на loopback)
+scripts/setup-global-mcp.sh my-agent '20-daily,90-inbox' '*'
+
+# установка за Caddy
+GBRAIN_BASE_URL=https://gbrain.example.com scripts/setup-global-mcp.sh my-agent 'read'
+```
+
+Скрипт выпускает токен и прописывает все четыре сервера одной командой. Raw-токен
+не печатается и не пишется на диск: живёт только в переменной shell и уходит прямо
+в конфиг. Повторный запуск ротирует токен — `issue-agent-token.py` перезаписывает
+`token_sha256` через `ON CONFLICT DO UPDATE`, старый перестаёт действовать.
+
+Запускать нужно обычным пользователем, не под `sudo`: `claude mcp add` пишет в
+`~/.claude.json` того, от чьего имени идёт запуск, а под root конфиг уедет в
+`/root`. Сам выпуск токена скрипт поднимает до `SERVICE_USER` сам — этого требует
+peer-аутентификация Postgres.
+
+Локальный `.mcp.json` перекрывает user-scope, поэтому workspace с собственным
+токеном продолжает работать на нём.
+
 ---
 
 ### Openclaw
