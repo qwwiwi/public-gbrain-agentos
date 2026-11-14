@@ -131,25 +131,38 @@ class TestSlugifyTransliteration:
 
 
 class TestAllocateNotePath:
-    def test_fallback_slug(self, tmp_path: Path) -> None:
-        rel, _ = _allocate_note_path("30-decisions/2026-11-14-", "🚀", "b", str(tmp_path))
+    @pytest.mark.asyncio
+    async def test_fallback_slug(self, tmp_path: Path) -> None:
+        rel, _ = await _allocate_note_path(DocStorePool(), "30-decisions/2026-11-14-", "🚀", "b", str(tmp_path))
         assert rel.startswith(f"30-decisions/2026-11-14-{NOTE_SLUG_FALLBACK}-")
         assert re.search(SUFFIX_RE, rel)
 
-    def test_collision_with_different_note_gets_counter(self, tmp_path: Path) -> None:
-        rel, abs_path = _allocate_note_path("70-runbooks/", "Т", "body", str(tmp_path))
+    @pytest.mark.asyncio
+    async def test_collision_with_different_note_gets_counter(self, tmp_path: Path) -> None:
+        pool = DocStorePool()
+        rel, abs_path = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text("someone else's note\n", encoding="utf-8")
-        rel2, _ = _allocate_note_path("70-runbooks/", "Т", "body", str(tmp_path))
+        rel2, _ = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
         assert rel2 != rel
         assert rel2.endswith("-2.md")
 
-    def test_same_note_reuses_path(self, tmp_path: Path) -> None:
-        rel, abs_path = _allocate_note_path("70-runbooks/", "Т", "body", str(tmp_path))
+    @pytest.mark.asyncio
+    async def test_same_note_reuses_path(self, tmp_path: Path) -> None:
+        pool = DocStorePool()
+        rel, abs_path = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text("---\na: 1\n---\n\n# Т\n\nbody\n", encoding="utf-8")
-        rel2, _ = _allocate_note_path("70-runbooks/", "Т", "body", str(tmp_path))
+        rel2, _ = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
         assert rel2 == rel
+
+    @pytest.mark.asyncio
+    async def test_orphan_db_row_is_not_reused(self, tmp_path: Path) -> None:
+        pool = DocStorePool()
+        rel, _ = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
+        pool.docs[rel] = {"id": 1, "body": "other", "sha256": "x"}  # file gone
+        rel2, _ = await _allocate_note_path(pool, "70-runbooks/", "Т", "body", str(tmp_path))
+        assert rel2 != rel
 
 
 # ---------------------------------------------------------------------------

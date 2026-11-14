@@ -228,15 +228,15 @@ def _note_suffix(title: str, body: str) -> str:
     return digest[:NOTE_SUFFIX_LENGTH]
 
 
-def _allocate_note_path(
-    prefix: str, title: str, body: str, vault_root: str,
+async def _allocate_note_path(
+    pool: "asyncpg.Pool", prefix: str, title: str, body: str, vault_root: str,
 ) -> tuple[str, Path]:
     """Return ``(rel_path, abs_path)`` for a new note that never clobbers another.
 
     ``prefix`` is everything before the slug, e.g. ``"30-decisions/2026-11-14-"``.
     A path is reused only when the file already holds this exact title+body
-    (idempotent retry); any other existing file makes us try the next
-    counter suffix.
+    (idempotent retry); any other existing file, or a ``documents`` row
+    whose file is gone, makes us try the next counter suffix.
     """
     slug = _slugify(title) or NOTE_SLUG_FALLBACK
     base = _note_suffix(title, body)
@@ -246,7 +246,12 @@ def _allocate_note_path(
         rel_path = f"{prefix}{slug}-{suffix}.md"
         abs_path = validate_path(rel_path, vault_root)
         if not abs_path.exists():
-            return rel_path, abs_path
+            row = await pool.fetchrow(
+                "SELECT id, sha256 FROM documents WHERE path = $1", rel_path,
+            )
+            if row is None:
+                return rel_path, abs_path
+            continue  # orphan DB row of another note: never overwrite it
         try:
             if abs_path.read_text(encoding="utf-8").endswith(own_tail):
                 return rel_path, abs_path
@@ -566,8 +571,8 @@ def register_tools(
         # frontmatter attribution only.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/{_today_iso()}-", title, body, vault_root,
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{_today_iso()}-", title, body, vault_root,
         )
 
         # Read thresholds dynamically per-call so tests + operators can flip
@@ -992,8 +997,8 @@ def register_tools(
         # parameter is human-attribution only — never the audit identity.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/", title, body, vault_root,
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/", title, body, vault_root,
         )
 
         fm: dict[str, Any] = {
@@ -1059,8 +1064,8 @@ def register_tools(
         # parameter is human-attribution only — never the audit identity.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/{_today_iso()}-", title, body, vault_root,
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{_today_iso()}-", title, body, vault_root,
         )
 
         fm: dict[str, Any] = {
@@ -1127,8 +1132,8 @@ def register_tools(
             )
 
         safe_source = re.sub(r"[^a-z0-9_-]+", "-", source.lower()).strip("-")
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/{safe_source}/{_today_iso()}-", title, body, vault_root,
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{safe_source}/{_today_iso()}-", title, body, vault_root,
         )
 
         fm = {
@@ -1188,8 +1193,8 @@ def register_tools(
                 f"Agent '{agent_ctx.agent}' cannot write to {scope}"
             )
 
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/{from_agent}-to-{to_agent}-{_today_iso()}-",
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{from_agent}-to-{to_agent}-{_today_iso()}-",
             title, body, vault_root,
         )
 
@@ -1432,8 +1437,8 @@ def register_tools(
 
         supersedes_line = f"Supersedes [[{old_path}]]"
         full_body = f"{supersedes_line}\n\n**Reason:** {reason}\n\n{new_body}"
-        rel_path, abs_path = _allocate_note_path(
-            f"{scope}/{_today_iso()}-", new_title, full_body, vault_root,
+        rel_path, abs_path = await _allocate_note_path(
+            pool, f"{scope}/{_today_iso()}-", new_title, full_body, vault_root,
         )
 
         fm = {
