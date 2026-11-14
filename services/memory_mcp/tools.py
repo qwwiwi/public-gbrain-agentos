@@ -6,6 +6,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,31 @@ _REQUEST_AUTH: ContextVar[AuthValue] = ContextVar("memory_request_auth", default
 # ---------------------------------------------------------------------------
 
 MAX_SLUG_LENGTH = 60
+
+# Note filename policy (issue #19): every note created by a tool gets
+#   <prefix><slug>-<suffix>.md
+# where <slug> is the transliterated title (fallback NOTE_SLUG_FALLBACK when
+# nothing survives, e.g. an emoji-only title) and <suffix> is the first
+# NOTE_SUFFIX_LENGTH hex chars of sha1(title + body). Same title + same body
+# maps to the same path (idempotent retries stay "unchanged"); a different
+# body with the same title gets a different path, so one note never silently
+# overwrites another. On the rare suffix collision with a different note a
+# counter is appended (-2, -3, ...).
+NOTE_SLUG_FALLBACK = "note"
+NOTE_SUFFIX_LENGTH = 6
+MAX_NOTE_PATH_ATTEMPTS = 100
+
+# Russian (plus common Ukrainian/Belarusian) Cyrillic -> Latin, close to
+# GOST 7.79 / ICAO 9303 but readable. Lower-case keys only; _slugify lowers
+# the title first.
+_CYRILLIC_TO_LATIN = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "і": "i", "ї": "yi", "є": "ye", "ґ": "g", "ў": "u",
+}
 
 # ---------------------------------------------------------------------------
 # Slot constants
@@ -174,9 +200,62 @@ def _require_slots_write(agent_ctx: AgentContext) -> None:
         )
 
 
+def _transliterate(text: str) -> str:
+    """Map Cyrillic to Latin and strip diacritics (no external deps)."""
+    mapped = "".join(_CYRILLIC_TO_LATIN.get(ch, ch) for ch in text.lower())
+    return (
+        unicodedata.normalize("NFKD", mapped)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
+
 def _slugify(title: str) -> str:
-    """Generate a URL-safe slug from a title."""
-    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:MAX_SLUG_LENGTH]
+    """Generate a URL-safe slug from a title.
+
+    Cyrillic is transliterated, accents are stripped, everything else outside
+    ``[a-z0-9]`` collapses to ``-``. May return ``""`` (e.g. emoji-only
+    title); note paths use :func:`_allocate_note_path`, which falls back to
+    ``NOTE_SLUG_FALLBACK``.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", _transliterate(title)).strip("-")
+    return slug[:MAX_SLUG_LENGTH].strip("-")
+
+
+def _note_suffix(title: str, body: str) -> str:
+    """Short content-derived suffix: same title+body -> same suffix."""
+    digest = hashlib.sha1(f"{title}\n{body}".encode("utf-8")).hexdigest()
+    return digest[:NOTE_SUFFIX_LENGTH]
+
+
+def _allocate_note_path(
+    prefix: str, title: str, body: str, vault_root: str,
+) -> tuple[str, Path]:
+    """Return ``(rel_path, abs_path)`` for a new note that never clobbers another.
+
+    ``prefix`` is everything before the slug, e.g. ``"30-decisions/2026-11-14-"``.
+    A path is reused only when the file already holds this exact title+body
+    (idempotent retry); any other existing file makes us try the next
+    counter suffix.
+    """
+    slug = _slugify(title) or NOTE_SLUG_FALLBACK
+    base = _note_suffix(title, body)
+    own_tail = f"\n# {title}\n\n{body}\n"
+    for attempt in range(MAX_NOTE_PATH_ATTEMPTS):
+        suffix = base if attempt == 0 else f"{base}-{attempt + 1}"
+        rel_path = f"{prefix}{slug}-{suffix}.md"
+        abs_path = validate_path(rel_path, vault_root)
+        if not abs_path.exists():
+            return rel_path, abs_path
+        try:
+            if abs_path.read_text(encoding="utf-8").endswith(own_tail):
+                return rel_path, abs_path
+        except OSError as exc:
+            logger.warning("Could not read %s while allocating path: %s", rel_path, exc)
+    raise RuntimeError(
+        f"Could not allocate a free note path for prefix {prefix!r} after "
+        f"{MAX_NOTE_PATH_ATTEMPTS} attempts"
+    )
 
 
 def _today_iso() -> str:
@@ -487,9 +566,9 @@ def register_tools(
         # frontmatter attribution only.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        slug = _slugify(title)
-        rel_path = f"{scope}/{_today_iso()}-{slug}.md"
-        abs_path = validate_path(rel_path, vault_root)
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/{_today_iso()}-", title, body, vault_root,
+        )
 
         # Read thresholds dynamically per-call so tests + operators can flip
         # GBRAIN_SUPERSEDE_AUTO/HINT without restarting the service. Falls
@@ -913,9 +992,9 @@ def register_tools(
         # parameter is human-attribution only — never the audit identity.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        slug = _slugify(title)
-        rel_path = f"{scope}/{slug}.md"
-        abs_path = validate_path(rel_path, vault_root)
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/", title, body, vault_root,
+        )
 
         fm: dict[str, Any] = {
             "type": "runbook",
@@ -980,9 +1059,9 @@ def register_tools(
         # parameter is human-attribution only — never the audit identity.
         resolved_agent = agent_ctx.agent
         declared_author = agent if (agent and agent != agent_ctx.agent) else None
-        slug = _slugify(title)
-        rel_path = f"{scope}/{_today_iso()}-{slug}.md"
-        abs_path = validate_path(rel_path, vault_root)
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/{_today_iso()}-", title, body, vault_root,
+        )
 
         fm: dict[str, Any] = {
             "type": "error-pattern",
@@ -1047,10 +1126,10 @@ def register_tools(
                 f"Agent '{agent_ctx.agent}' cannot write to {scope}"
             )
 
-        slug = _slugify(title)
         safe_source = re.sub(r"[^a-z0-9_-]+", "-", source.lower()).strip("-")
-        rel_path = f"{scope}/{safe_source}/{_today_iso()}-{slug}.md"
-        abs_path = validate_path(rel_path, vault_root)
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/{safe_source}/{_today_iso()}-", title, body, vault_root,
+        )
 
         fm = {
             "type": "external",
@@ -1109,8 +1188,10 @@ def register_tools(
                 f"Agent '{agent_ctx.agent}' cannot write to {scope}"
             )
 
-        rel_path = f"{scope}/{from_agent}-to-{to_agent}-{_today_iso()}.md"
-        abs_path = validate_path(rel_path, vault_root)
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/{from_agent}-to-{to_agent}-{_today_iso()}-",
+            title, body, vault_root,
+        )
 
         fm = {
             "type": "handoff",
@@ -1349,12 +1430,11 @@ def register_tools(
         if not old_abs.exists():
             raise ValueError(f"Original decision not found: {old_path}")
 
-        slug = _slugify(new_title)
-        rel_path = f"{scope}/{_today_iso()}-{slug}.md"
-        abs_path = validate_path(rel_path, vault_root)
-
         supersedes_line = f"Supersedes [[{old_path}]]"
         full_body = f"{supersedes_line}\n\n**Reason:** {reason}\n\n{new_body}"
+        rel_path, abs_path = _allocate_note_path(
+            f"{scope}/{_today_iso()}-", new_title, full_body, vault_root,
+        )
 
         fm = {
             "type": "decision",

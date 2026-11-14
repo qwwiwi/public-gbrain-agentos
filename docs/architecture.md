@@ -122,6 +122,8 @@ Plain markdown on a filesystem, mounted at `${VAULT_ROOT}` (default `/opt/gbrain
 
 **File naming:** `YYYY-MM-DD-<slug>.md` is the convention but not enforced. The agent name and write timestamp are also in YAML frontmatter at the top of each file.
 
+Notes created by memory-mcp tools are named `<prefix><slug>-<suffix>.md` (prefix is the scope folder plus `YYYY-MM-DD-` for dated types; runbooks have no date). `<slug>` is the title transliterated to Latin (Cyrillic is mapped, accents stripped, max 60 chars), or `note` when nothing is left (e.g. an emoji-only title). `<suffix>` is 6 hex chars of `sha1(title + body)`: re-sending the same note is idempotent, while a different note with the same title gets its own file. If that path is already taken by a different note, `-2`, `-3`, … is appended. A tool never overwrites another note's file (issue #19).
+
 **Frontmatter:**
 
 ```yaml
